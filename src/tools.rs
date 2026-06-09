@@ -104,8 +104,8 @@ pub fn handle_store(db: &Database, args: Value) -> Result<String, String> {
         })
         .collect();
 
-    let summary = if store_args.content.len() > 80 {
-        Some(store_args.content[..80].to_string())
+    let summary = if store_args.content.chars().count() > 80 {
+        Some(store_args.content.chars().take(80).collect::<String>())
     } else {
         Some(store_args.content.clone())
     };

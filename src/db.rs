@@ -79,38 +79,53 @@ impl Database {
         let links_json = serde_json::to_string(&item.links)?;
         let summary = item.summary.as_deref().unwrap_or("");
 
-        self.conn.execute(
-            "INSERT INTO memories (id, content, type, summary, relevance, decay_score,
-             retrieval_count, layer, topic_path, created_at_unix_ms, last_accessed_unix_ms,
-             workspace_hash, tags, links, source, verified)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![
-                item.id,
-                item.content,
-                item.memory_type,
-                summary,
-                item.relevance,
-                item.decay_score,
-                item.retrieval_count,
-                item.layer,
-                item.topic_path,
-                item.created_at_unix_ms,
-                item.last_accessed_unix_ms,
-                item.workspace_hash,
-                tags_json,
-                links_json,
-                item.source,
-                item.verified as i32,
-            ],
-        )?;
+        // Wrap in transaction so FTS index and main table stay consistent
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            self.conn.execute(
+                "INSERT INTO memories (id, content, type, summary, relevance, decay_score,
+                 retrieval_count, layer, topic_path, created_at_unix_ms, last_accessed_unix_ms,
+                 workspace_hash, tags, links, source, verified)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    item.id,
+                    item.content,
+                    item.memory_type,
+                    summary,
+                    item.relevance,
+                    item.decay_score,
+                    item.retrieval_count,
+                    item.layer,
+                    item.topic_path,
+                    item.created_at_unix_ms,
+                    item.last_accessed_unix_ms,
+                    item.workspace_hash,
+                    tags_json,
+                    links_json,
+                    item.source,
+                    item.verified as i32,
+                ],
+            )?;
 
-        // Also insert into FTS index
-        self.conn.execute(
-            "INSERT INTO memories_fts (rowid, content) VALUES (last_insert_rowid(), ?1)",
-            params![item.content],
-        )?;
+            // Also insert into FTS index
+            self.conn.execute(
+                "INSERT INTO memories_fts (rowid, content) VALUES (last_insert_rowid(), ?1)",
+                params![item.content],
+            )?;
 
-        Ok(())
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     // Mirrors MCP recall parameters; keep this flat until a request type exists.
@@ -188,11 +203,12 @@ impl Database {
             param_values.push(Box::new(min_decay_score));
         }
 
-        // Filter by topic path
+        // Filter by topic path (prefix match, escape LIKE wildcards)
         if let Some(ref tp) = topic_path {
             if !tp.is_empty() {
                 conditions.push(format!("topic_path LIKE ?{}", param_values.len() + 1));
-                param_values.push(Box::new(format!("{}%", tp)));
+                let escaped = tp.replace('%', "\\%").replace('_', "\\_");
+                param_values.push(Box::new(format!("{}%", escaped)));
             }
         }
 
