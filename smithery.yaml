@@ -1,0 +1,17 @@
+# Smithery.ai configuration
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      dbPath:
+        type: string
+        description: Path to the SQLite database file
+        default: ~/.mimir/data/mimir.db
+  commandFunction: |-
+    (config) => ({
+      command: 'mimir',
+      args: ['--db', config.dbPath || '~/.mimir/data/mimir.db']
+    })
+  exampleConfig:
+    dbPath: ~/.mimir/data/mimir.db
