@@ -26,6 +26,8 @@ pub struct RememberArgs {
     pub importance: f64,
     #[serde(default)]
     pub topic_path: String,
+    #[serde(default)]
+    pub recall_when: Vec<String>,
 }
 
 fn default_status() -> String {
@@ -50,6 +52,8 @@ pub struct RecallArgs {
     pub entity_type: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
     #[serde(default)]
     pub min_decay: f64,
     #[serde(default)]
@@ -126,6 +130,8 @@ pub struct TimelineArgs {
     pub entity_id: Option<String>,
     #[serde(default = "default_timeline_limit")]
     pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 fn default_timeline_limit() -> i64 {
@@ -196,6 +202,23 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         return Err(format!("body_json is not valid JSON: {}", e));
     }
 
+    // Merge recall_when into body_json if provided
+    let body = if a.recall_when.is_empty() {
+        a.body_json
+    } else {
+        let mut obj: serde_json::Value =
+            serde_json::from_str(&a.body_json).unwrap_or(serde_json::json!({}));
+        if let Some(map) = obj.as_object_mut() {
+            let triggers: Vec<serde_json::Value> = a
+                .recall_when
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect();
+            map.insert("recall_when".to_string(), serde_json::Value::Array(triggers));
+        }
+        serde_json::to_string(&obj).unwrap_or(a.body_json)
+    };
+
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
     let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
     let now = now_ms();
@@ -204,7 +227,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         id,
         category: a.category,
         key: a.key,
-        body_json: a.body_json,
+        body_json: body,
         status: a.status,
         entity_type: a.entity_type,
         tags: a.tags,
@@ -255,6 +278,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         category: a.category,
         entity_type: a.entity_type,
         limit: a.limit,
+        offset: a.offset,
         min_decay: a.min_decay,
         topic_path: a.topic_path,
         include_archived: a.include_archived,
@@ -312,6 +336,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             category: a.category.clone(),
             entity_type: a.entity_type.clone(),
             limit: a.limit.max(50), // fetch more per variant to have good merge pool
+            offset: 0,
             min_decay: a.min_decay,
             topic_path: a.topic_path.clone(),
             include_archived: a.include_archived,
@@ -465,6 +490,7 @@ pub fn handle_timeline(db: &Database, args: Value) -> Result<String, String> {
         category: a.category,
         entity_id: a.entity_id,
         limit: a.limit,
+        offset: a.offset,
     };
 
     let events = db
@@ -808,4 +834,46 @@ pub fn handle_workspace_list(db: &Database) -> String {
         Ok(cats) => json!({"categories": cats, "total": cats.len()}).to_string(),
         Err(e) => json!({"error": format!("Workspace list failed: {}", e)}).to_string(),
     }
+}
+
+// ─── New: recall_when + cohere handlers ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RecallWhenArgs {
+    pub context: String,
+    #[serde(default = "default_rw_limit")]
+    pub limit: i64,
+}
+
+fn default_rw_limit() -> i64 { 10 }
+
+pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> {
+    let a: RecallWhenArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid recall_when arguments: {}", e))?;
+
+    let entities = db
+        .recall_when(&a.context, a.limit)
+        .map_err(|e| format!("Recall_when failed: {}", e))?;
+
+    let items_expanded: Vec<serde_json::Value> =
+        entities.iter().map(|e| e.to_json_expanded()).collect();
+
+    let result = json!({
+        "items": items_expanded,
+        "total": items_expanded.len(),
+        "context": a.context,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_cohere(db: &Database, args: Value) -> Result<String, String> {
+    let params: crate::models::CohereParams =
+        serde_json::from_value(args).map_err(|e| format!("Invalid cohere arguments: {}", e))?;
+
+    let report = db
+        .cohere(&params)
+        .map_err(|e| format!("Cohere failed: {}", e))?;
+
+    serde_json::to_string(&report)
+        .map_err(|e| format!("Serialization failed: {}", e))
 }

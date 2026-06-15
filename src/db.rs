@@ -937,6 +937,12 @@ impl Database {
         sql.push_str(&format!(" LIMIT ?{}", param_values.len() + 1));
         param_values.push(Box::new(safe_limit));
 
+        if params.offset > 0 {
+            let safe_offset = params.offset.clamp(0, 10000);
+            sql.push_str(&format!(" OFFSET ?{}", param_values.len() + 1));
+            param_values.push(Box::new(safe_offset));
+        }
+
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
@@ -1181,6 +1187,12 @@ impl Database {
         let safe_limit = params.limit.clamp(0, 1000);
         sql.push_str(&format!(" LIMIT ?{}", param_values.len() + 1));
         param_values.push(Box::new(safe_limit));
+
+        if params.offset > 0 {
+            let safe_offset = params.offset.clamp(0, 10000);
+            sql.push_str(&format!(" OFFSET ?{}", param_values.len() + 1));
+            param_values.push(Box::new(safe_offset));
+        }
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
@@ -2061,6 +2073,184 @@ last_accessed: {}
             cats.push(row?);
         }
         Ok(cats)
+    }
+
+    /// recall_when search: match a trigger context against entities' recall_when fields.
+    /// Searches body_json for `"recall_when": ["...trigger..."]` patterns that contain
+    /// any substring match against the given context text.
+    pub fn recall_when(
+        &self,
+        context: &str,
+        limit: i64,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let words: Vec<&str> = context
+            .split_whitespace()
+            .filter(|w| w.len() >= 3)
+            .collect();
+
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build LIKE clauses for each significant word in the context
+        // matching against body_json which should contain "recall_when" array entries
+        let mut like_parts = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        for (i, word) in words.iter().enumerate() {
+            let param_idx = i + 1;
+            like_parts.push(format!("body_json LIKE ?{}", param_idx));
+            params_vec.push(Box::new(format!("%recall_when%{}%", word.replace('\'', "''"))));
+        }
+
+        let sql = format!(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms
+             FROM entities
+             WHERE archived = 0 AND ({})
+             ORDER BY decay_score DESC, retrieval_count DESC
+             LIMIT ?{}",
+            like_parts.join(" OR "),
+            params_vec.len() + 1
+        );
+
+        let safe_limit = limit.clamp(0, 100);
+        params_vec.push(Box::new(safe_limit));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let enc = self.encryption.as_ref();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            entity_from_row(row, enc)
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Coherence daemon: auto-groom the memory with promote, decay, link, archive.
+    pub fn cohere(
+        &self,
+        params: &crate::models::CohereParams,
+    ) -> Result<crate::models::CohereReport, Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let mut promoted: i64 = 0;
+        let mut decayed: i64 = 0;
+        let mut linked: i64 = 0;
+        let mut archived: i64 = 0;
+
+        // Count total examined
+        let examined: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE archived = 0",
+            [],
+            |r| r.get(0),
+        )?;
+
+        if params.dry_run {
+            return Ok(crate::models::CohereReport {
+                promoted: 0,
+                decayed: 0,
+                linked: 0,
+                archived: 0,
+                entities_examined: examined,
+                dry_run: true,
+                completed_at_unix_ms: now,
+            });
+        }
+
+        // 1. Promote: buffer layer entities with retrieval_count >= threshold → working
+        let promote_threshold = if params.promote_threshold > 0 {
+            params.promote_threshold
+        } else {
+            3
+        };
+        promoted = self.conn.execute(
+            "UPDATE entities SET layer = 'working' WHERE layer = 'buffer' AND retrieval_count >= ?1",
+            params![promote_threshold],
+        )? as i64;
+
+        // 2. Decay: apply Ebbinghaus decay to all non-archived entities
+        // Formula: new_score = current_score * 0.95 (gentle decay)
+        let decayed_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND decay_score > 0.01",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE entities SET decay_score = decay_score * 0.95 WHERE archived = 0 AND decay_score > 0.01",
+            [],
+        )?;
+        decayed = decayed_count;
+
+        // 3. Link: auto-link entities with shared tags within same category
+        // Find entities with overlapping tags who aren't already linked
+        let mut stmt = self.conn.prepare(
+            "SELECT e1.id, e1.category, e1.key, e1.tags, e2.id as e2_id
+             FROM entities e1
+             JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
+             WHERE e1.archived = 0 AND e2.archived = 0
+             AND e1.tags != '[]' AND e2.tags != '[]'
+             LIMIT ?1",
+        )?;
+
+        let max_links = params.max_links.clamp(0, 100) as i64;
+        let rows = stmt.query_map(params![max_links], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (e1_id, cat, key, _tags1_str, e2_id) = row?;
+
+            // Create a simple "related" link from e1 to e2
+            if let Err(e) = self.link(&cat, &key, &e2_id, "auto-related") {
+                eprintln!("mimir: cohere link error: {}", e);
+                continue;
+            }
+            linked += 1;
+        }
+
+        // 4. Archive: entities below decay threshold
+        let archive_threshold = if params.archive_threshold > 0.0 {
+            params.archive_threshold
+        } else {
+            0.05
+        };
+        archived = self.conn.execute(
+            "UPDATE entities SET archived = 1, archive_reason = 'auto-archived by coherence daemon (decay < threshold)'
+             WHERE archived = 0 AND decay_score < ?1",
+            params![archive_threshold],
+        )? as i64;
+
+        // Clean FTS5 entries for archived entities
+        if archived > 0 {
+            self.conn.execute(
+                "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1)",
+                [],
+            )?;
+        }
+
+        Ok(crate::models::CohereReport {
+            promoted,
+            decayed,
+            linked,
+            archived,
+            entities_examined: examined,
+            dry_run: false,
+            completed_at_unix_ms: now,
+        })
     }
 }
 
