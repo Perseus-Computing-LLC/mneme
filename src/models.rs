@@ -134,6 +134,7 @@ pub struct RecallParams {
     pub category: Option<String>,
     pub entity_type: Option<String>,
     pub limit: i64,
+    pub offset: i64,
     pub min_decay: f64,
     pub topic_path: Option<String>,
     pub include_archived: bool,
@@ -186,6 +187,7 @@ impl Default for RecallParams {
             category: None,
             entity_type: None,
             limit: 10,
+            offset: 0,
             min_decay: 0.0,
             topic_path: None,
             include_archived: false,
@@ -204,6 +206,7 @@ pub struct TimelineParams {
     pub category: Option<String>,
     pub entity_id: Option<String>,
     pub limit: i64,
+    pub offset: i64,
 }
 
 impl Default for TimelineParams {
@@ -215,6 +218,7 @@ impl Default for TimelineParams {
             category: None,
             entity_id: None,
             limit: 50,
+            offset: 0,
         }
     }
 }
@@ -252,6 +256,35 @@ pub struct DecayReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactReport {
     pub entities_archived: i64,
+    pub entities_examined: i64,
+    pub dry_run: bool,
+    pub completed_at_unix_ms: i64,
+}
+
+/// Parameters for the coherence daemon pass.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CohereParams {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default = "default_max_links")]
+    pub max_links: usize,
+    #[serde(default)]
+    pub promote_threshold: i64,
+    #[serde(default = "default_archive_threshold")]
+    pub archive_threshold: f64,
+}
+
+fn default_max_links() -> usize { 20 }
+fn default_archive_threshold() -> f64 { 0.05 }
+fn default_promote_threshold() -> i64 { 3 }
+
+/// Coherence daemon report — results of an auto-grooming pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct CohereReport {
+    pub promoted: i64,
+    pub decayed: i64,
+    pub linked: i64,
+    pub archived: i64,
     pub entities_examined: i64,
     pub dry_run: bool,
     pub completed_at_unix_ms: i64,

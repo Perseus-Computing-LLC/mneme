@@ -294,7 +294,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "limit": {
           "type": "integer",
           "default": 10,
-          "description": "Maximum number of results to return"
+          "description": "Maximum number of results to return (max 1000)"
+        },
+        "offset": {
+          "type": "integer",
+          "default": 0,
+          "description": "Number of results to skip for pagination"
         },
         "min_decay": {
           "type": "number",
@@ -726,7 +731,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "limit": {
           "type": "integer",
           "default": 50,
-          "description": "Maximum number of events to return"
+          "description": "Maximum number of events to return (max 1000)"
+        },
+        "offset": {
+          "type": "integer",
+          "default": 0,
+          "description": "Number of events to skip for pagination"
         }
       },
       "required": []
@@ -1409,6 +1419,80 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "annotations": {
       "readOnlyHint": true
     }
+  },
+  {
+    "name": "mimir_recall_when",
+    "description": "Search entities whose recall_when triggers match a given context. Use this for proactive just-in-time memory injection \u2014 before writing code, before plans, at session start. Pass the current task description as context and get back memories that declared they should be recalled in similar situations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "context": {
+          "type": "string",
+          "description": "The current task or context description to match against recall_when triggers"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Maximum entities to return (default 10, max 100)",
+          "default": 10
+        }
+      },
+      "required": ["context"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {"type": "array", "items": {"type": "object"}},
+        "total": {"type": "integer"},
+        "context": {"type": "string"}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_cohere",
+    "description": "Run an autonomous coherence grooming pass over the memory. Promotes buffer entities to working layer, applies decay, auto-links related entities, and archives stale ones below the decay threshold. Use dry_run=true to preview without making changes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean",
+          "description": "If true, count what would be done without making changes",
+          "default": false
+        },
+        "max_links": {
+          "type": "integer",
+          "description": "Maximum auto-links to create (default 20, max 100)",
+          "default": 20
+        },
+        "promote_threshold": {
+          "type": "integer",
+          "description": "Retrieval count threshold for buffer to working promotion (default 3)",
+          "default": 3
+        },
+        "archive_threshold": {
+          "type": "number",
+          "description": "Decay score below which entities are auto-archived (default 0.05)",
+          "default": 0.05
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "promoted": {"type": "integer", "description": "Number of entities promoted from buffer to working"},
+        "decayed": {"type": "integer", "description": "Number of entities whose decay score was reduced"},
+        "linked": {"type": "integer", "description": "Number of auto-links created"},
+        "archived": {"type": "integer", "description": "Number of entities archived due to low decay"},
+        "entities_examined": {"type": "integer", "description": "Total non-archived entities examined"},
+        "dry_run": {"type": "boolean"},
+        "completed_at_unix_ms": {"type": "integer"}
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
   }
 ]"###
     ).expect("tools JSON must be valid");
@@ -1504,6 +1588,8 @@ fn call_tool(
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
         "mimir_workspace_list" => Ok(tools::handle_workspace_list(db)),
+        "mimir_recall_when" => tools::handle_recall_when(db, args).map_err(|e| error_response(id, -32603, &e)),
+        "mimir_cohere" => tools::handle_cohere(db, args).map_err(|e| error_response(id, -32603, &e)),
 
         _ => Err(error_response(
             id,
