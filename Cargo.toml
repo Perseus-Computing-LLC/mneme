@@ -27,3 +27,5 @@ tower-http = { version = "0.5", features = ["cors"] }
 ureq = "2"
 notify = "6"
 serde_yaml = "0.9"
+async-stream = "0.3"
+futures = "0.3"

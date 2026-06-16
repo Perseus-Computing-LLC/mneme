@@ -5,6 +5,7 @@ mod mcp;
 mod models;
 mod schema;
 mod tools;
+mod transport;
 mod util;
 mod web;
 
@@ -55,6 +56,10 @@ struct Cli {
     /// Deprecated compatibility flag; MCP stdio mode is always enabled
     #[arg(long = "mcp", default_value_t = false, hide = true)]
     _mcp: bool,
+
+    /// MCP transport mode: stdio (default), sse, or http
+    #[arg(long, default_value_t = String::from("stdio"))]
+    transport: String,
 }
 
 #[derive(Subcommand)]
@@ -96,6 +101,10 @@ enum Commands {
         /// Deprecated compatibility flag; MCP stdio mode is always enabled
         #[arg(long = "mcp", default_value_t = false, hide = true)]
         _mcp: bool,
+
+        /// MCP transport mode: stdio (default), sse, or http
+        #[arg(long, default_value_t = String::from("stdio"))]
+        transport: String,
     },
 
     /// Migrate a v0.1.x Mimir database to v0.2.0 schema
@@ -202,7 +211,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref web_bind, ref llm_endpoint, ref llm_model, ref connectors_config, .. }) => {
+        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref web_bind, ref llm_endpoint, ref llm_model, ref connectors_config, ref transport, .. }) => {
             let db_path = db.clone();
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
@@ -287,7 +296,35 @@ fn main() {
                 });
             }
 
-            mcp::run_server(database);
+            // Determine transport mode
+            let tmode = match transport.as_str() {
+                "sse" => Some(crate::transport::TransportMode::Sse),
+                "http" => Some(crate::transport::TransportMode::Http),
+                _ => None,
+            };
+
+            if let Some(mode) = tmode {
+                let transport_db = std::sync::Arc::new(std::sync::Mutex::new(database));
+                crate::transport::init_transport_state(transport_db);
+                let transport_router = crate::transport::build_transport_router(mode);
+                let transport_addr = format!("{}:{}", web_bind, *port);
+                let mode_label = match mode {
+                    transport::TransportMode::Sse => "sse",
+                    transport::TransportMode::Http => "http",
+                };
+                eprintln!("mimir: MCP over {} transport on http://{}", mode_label, transport_addr);
+                eprintln!("mimir: POST http://{}/message", transport_addr);
+                if mode == transport::TransportMode::Sse {
+                    eprintln!("mimir: GET  http://{}/sse", transport_addr);
+                }
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let listener = tokio::net::TcpListener::bind(&transport_addr).await.unwrap();
+                    axum::serve(listener, transport_router).await.unwrap();
+                });
+            } else {
+                mcp::run_server(database);
+            }
         }
         None => {
             let db_path = cli.db.clone();
@@ -370,7 +407,35 @@ fn main() {
                 });
             }
 
-            mcp::run_server(database);
+            // Determine transport mode
+            let transport_mode = match cli.transport.as_str() {
+                "sse" => Some(transport::TransportMode::Sse),
+                "http" => Some(transport::TransportMode::Http),
+                _ => None,
+            };
+
+            if let Some(mode) = transport_mode {
+                let transport_db = std::sync::Arc::new(std::sync::Mutex::new(database));
+                crate::transport::init_transport_state(transport_db);
+                let transport_router = crate::transport::build_transport_router(mode);
+                let transport_addr = format!("{}:{}", cli.web_bind, cli.port);
+                let mode_label = match mode {
+                    transport::TransportMode::Sse => "sse",
+                    transport::TransportMode::Http => "http",
+                };
+                eprintln!("mimir: MCP over {} transport on http://{}", mode_label, transport_addr);
+                eprintln!("mimir: POST http://{}/message", transport_addr);
+                if mode == transport::TransportMode::Sse {
+                    eprintln!("mimir: GET  http://{}/sse", transport_addr);
+                }
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let listener = tokio::net::TcpListener::bind(&transport_addr).await.unwrap();
+                    axum::serve(listener, transport_router).await.unwrap();
+                });
+            } else {
+                mcp::run_server(database);
+            }
         }
     }
 }

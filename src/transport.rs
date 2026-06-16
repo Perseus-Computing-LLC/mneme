@@ -1,0 +1,163 @@
+// MCP SSE + Streamable HTTP transport layer.
+// Reuses the core MCP JSON-RPC handler from crate::mcp.
+//
+// Uses static globals instead of axum Router state because axum 0.7's serve()
+// only accepts Router<()>. State is set once via init_transport_state() before
+// the server starts.
+
+use axum::{
+    extract::Query,
+    http::StatusCode,
+    response::{
+        sse::{Event, Sse},
+        Json,
+    },
+    routing::{get, post},
+    Router,
+};
+use futures::stream::Stream;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::db::Database;
+use crate::mcp::{self, JsonRpcRequest, MCPState};
+
+/// Transport mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransportMode {
+    Sse,
+    Http,
+}
+
+/// Shared state for the MCP HTTP transport, stored as a global static.
+struct TransportState {
+    db: Arc<Mutex<Database>>,
+    mcp_state: Arc<Mutex<MCPState>>,
+    sse_tx: broadcast::Sender<String>,
+}
+
+static TRANSPORT_STATE: OnceLock<TransportState> = OnceLock::new();
+
+/// Initialize the global transport state. Must be called before starting the server.
+pub fn init_transport_state(db: Arc<Mutex<Database>>) {
+    let (sse_tx, _) = broadcast::channel::<String>(256);
+    let state = TransportState {
+        db,
+        mcp_state: Arc::new(Mutex::new(MCPState::new())),
+        sse_tx,
+    };
+    TRANSPORT_STATE.set(state).ok();
+}
+
+/// Query params for POST /message
+#[derive(Debug, Deserialize)]
+struct MessageParams {
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Query params for GET /sse
+#[derive(Debug, Deserialize)]
+struct SseParams {
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Build the MCP HTTP transport router.
+pub fn build_transport_router(mode: TransportMode) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let router = Router::new()
+        .route("/message", post(handle_message))
+        .layer(cors);
+
+    if mode == TransportMode::Sse {
+        router.route("/sse", get(handle_sse))
+    } else {
+        router
+    }
+}
+
+/// Helper to get a reference to the global state.
+fn get_state() -> Result<&'static TransportState, StatusCode> {
+    TRANSPORT_STATE.get().ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// Handle POST /message — JSON-RPC request → JSON-RPC response.
+async fn handle_message(
+    Query(params): Query<MessageParams>,
+    axum::Json(request): axum::Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let req: JsonRpcRequest = match serde_json::from_value(request) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32700, "message": format!("Parse error: {}", e)}
+            })));
+        }
+    };
+
+    let state = get_state()?;
+    let mut mcp_state = state.mcp_state.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let response = mcp::handle_request(&req, &mut mcp_state, &db);
+
+    match response {
+        Some(resp) => {
+            if params.session_id.is_some() {
+                let resp_str = serde_json::to_string(&resp).unwrap_or_default();
+                let _ = state.sse_tx.send(resp_str);
+            }
+            Ok(Json(
+                serde_json::to_value(resp)
+                    .unwrap_or(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Serialization error"}})),
+            ))
+        }
+        None => Ok(Json(json!({"jsonrpc": "2.0", "id": null, "result": null}))),
+    }
+}
+
+/// Handle GET /sse — Server-Sent Events stream.
+async fn handle_sse(
+    Query(_params): Query<SseParams>,
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
+    let state = get_state()?;
+    let rx = state.sse_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        yield Ok(Event::default()
+            .event("endpoint")
+            .data("/message"));
+
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    yield Ok(Event::default()
+                        .event("message")
+                        .data(msg));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}

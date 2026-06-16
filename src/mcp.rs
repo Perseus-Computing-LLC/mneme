@@ -32,12 +32,12 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
-struct MCPState {
-    initialized: bool,
+pub struct MCPState {
+    pub initialized: bool,
 }
 
 impl MCPState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         MCPState { initialized: false }
     }
 }
@@ -96,7 +96,7 @@ pub fn run_server(db: Database) {
     }
 }
 
-fn handle_request(
+pub fn handle_request(
     req: &JsonRpcRequest,
     state: &mut MCPState,
     db: &Database,
