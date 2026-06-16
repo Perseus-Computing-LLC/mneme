@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/tcconnally/mimir/releases)
+[![Version](https://img.shields.io/badge/version-1.0.1-green.svg)](https://github.com/tcconnally/mimir/releases)
 
 ## What is Mimir?
 
@@ -29,6 +29,11 @@ Works with any MCP host: Claude Desktop, Cursor, OpenClaw, Hermes Agent, Perseus
 git clone https://github.com/tcconnally/mimir.git
 cd mimir
 cargo build --release
+
+# Linux/macOS: use cargo install to avoid macOS security kill (Killed: 9)
+cargo install --path .
+
+# Or copy manually (Linux only — macOS will kill the unsigned binary)
 cp target/release/mimir ~/.local/bin/
 
 # Or download the binary

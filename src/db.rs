@@ -57,7 +57,7 @@ impl Database {
         let conn = Connection::open(path)?;
 
         // Enable WAL for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; PRAGMA foreign_keys=ON;")?;
 
         // Initialize schema if this is a new database
         schema::initialize_schema(&conn)?;
