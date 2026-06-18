@@ -3037,4 +3037,43 @@ mod tests {
         let _ = fs::remove_file(&path2);
         let _ = fs::remove_file(&key_path);
     }
+
+    #[test]
+    fn rrf_hybrid_preserves_dense_only_results() {
+        // Regression test for #125: dense-only (pure semantic) hits
+        // should survive RRF fusion even when the sparse result set
+        // has no overlapping documents.
+        let dense_only = make_entity(
+            "dense-1",
+            "insight",
+            "only-in-dense",
+            r#"{"note": "semantic match"}"#,
+        );
+        let sparse_only = make_entity(
+            "sparse-1",
+            "insight",
+            "only-in-sparse",
+            r#"{"note": "keyword match"}"#,
+        );
+        let both = make_entity("both-1", "insight", "in-both", r#"{"note": "both"}"#);
+
+        let dense_results = vec![(dense_only, 0.95), (both.clone(), 0.80)];
+        let sparse_results = vec![(sparse_only, 1.0), (both, 0.9)];
+
+        let fused = crate::db::reciprocal_rank_fusion(&dense_results, &sparse_results, 60.0, 10);
+        let fused_ids: Vec<&str> = fused.iter().map(|(e, _)| e.id.as_str()).collect();
+
+        assert!(
+            fused_ids.contains(&"dense-1"),
+            "dense-only entity was dropped from hybrid results (regression #125)"
+        );
+        assert!(
+            fused_ids.contains(&"sparse-1"),
+            "sparse-only entity was dropped from hybrid results"
+        );
+        assert!(
+            fused_ids.contains(&"both-1"),
+            "overlapping entity was dropped from hybrid results"
+        );
+    }
 }
