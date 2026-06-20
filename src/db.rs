@@ -672,16 +672,53 @@ impl Database {
             Ok((entity, emb))
         })?;
 
-        let mut scored: Vec<(Entity, f64)> = Vec::new();
-        for row in rows {
-            let (entity, emb) = row?;
-            let sim = cosine_similarity(query_vec, &emb);
-            scored.push((entity, sim));
+        #[cfg(feature = "bundled-embeddings")]
+        {
+            // Batched cosine similarity using SIMD-accelerated ndarray ops
+            let mut entities: Vec<Entity> = Vec::new();
+            let mut all_embs: Vec<f32> = Vec::new();
+            let dim = query_vec.len();
+            for row in rows {
+                let (entity, emb) = row?;
+                if emb.len() == dim {
+                    all_embs.extend_from_slice(&emb);
+                    entities.push(entity);
+                }
+            }
+
+            let mut scored: Vec<(Entity, f64)> = Vec::new();
+            if !entities.is_empty() {
+                let n = entities.len();
+                let q = ndarray::Array1::from_vec(query_vec.to_vec());
+                let embs = ndarray::Array2::from_shape_vec((n, dim), all_embs)
+                    .unwrap_or_else(|_| ndarray::Array2::zeros((n, dim)));
+                let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let emb_norms = embs.mapv(|v| v * v).sum_axis(ndarray::Axis(1)).mapv(f32::sqrt);
+                let dots = embs.dot(&q);
+                for i in 0..n {
+                    let denom = q_norm * emb_norms[i];
+                    let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
+                    scored.push((entities.remove(0), sim));
+                }
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(limit);
+            return Ok(scored);
         }
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        Ok(scored)
+        #[cfg(not(feature = "bundled-embeddings"))]
+        {
+            // Row-by-row fallback (no ndarray available)
+            let mut scored: Vec<(Entity, f64)> = Vec::new();
+            for row in rows {
+                let (entity, emb) = row?;
+                let sim = cosine_similarity(query_vec, &emb);
+                scored.push((entity, sim));
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(limit);
+            return Ok(scored);
+        }
     }
 
     // ─── Decay & Layer Progression ──────────────────────────────────
