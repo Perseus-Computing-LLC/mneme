@@ -2072,18 +2072,32 @@ impl Database {
     /// Export all non-archived entities to .md files in a vault directory.
     /// Each entity becomes a .md file with YAML frontmatter.
     /// Idempotent — updates changed files, creates new ones, never deletes.
-    pub fn vault_export(&self, vault_dir: &str) -> Result<VaultReport, Box<dyn std::error::Error>> {
+    pub fn vault_export(
+        &self,
+        vault_dir: &str,
+        workspace_hash: Option<&str>,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
         use std::fs;
         use std::path::Path;
 
         fs::create_dir_all(vault_dir)?;
         let vault = Path::new(vault_dir);
 
-        let mut stmt = self.conn.prepare(
+        let sql = if let Some(ws) = workspace_hash {
+            format!(
+                "SELECT id, category, key, body_json, type, tags, decay_score,
+                        retrieval_count, layer, workspace_hash, agent_id,
+                        created_at_unix_ms, last_accessed_unix_ms
+                 FROM entities WHERE archived = 0 AND workspace_hash = '{}'",
+                ws.replace('\'', "''")
+            )
+        } else {
             "SELECT id, category, key, body_json, type, tags, decay_score,
-                    retrieval_count, layer, created_at_unix_ms, last_accessed_unix_ms
-             FROM entities WHERE archived = 0",
-        )?;
+                    retrieval_count, layer, workspace_hash, agent_id,
+                    created_at_unix_ms, last_accessed_unix_ms
+             FROM entities WHERE archived = 0".to_string()
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -2096,8 +2110,10 @@ impl Database {
                 r.get::<_, f64>(6)?,    // decay_score
                 r.get::<_, i64>(7)?,    // retrieval_count
                 r.get::<_, String>(8)?, // layer
-                r.get::<_, i64>(9)?,    // created_at
-                r.get::<_, i64>(10)?,   // last_accessed
+                r.get::<_, String>(9)?, // workspace_hash
+                r.get::<_, String>(10)?,// agent_id
+                r.get::<_, i64>(11)?,   // created_at
+                r.get::<_, i64>(12)?,   // last_accessed
             ))
         })?;
 
@@ -2116,6 +2132,8 @@ impl Database {
                 decay,
                 retrievals,
                 layer,
+                workspace_hash_val,
+                agent_id_val,
                 created,
                 accessed,
             ) = row?;
@@ -2142,6 +2160,8 @@ id: {}
 category: {}
 key: {}
 type: {}
+workspace_hash: {}
+agent_id: {}
 tags: {}
 decay_score: {:.4}
 retrieval_count: {}
@@ -2156,6 +2176,8 @@ last_accessed: {}
                 category,
                 key,
                 etype,
+                workspace_hash_val,
+                agent_id_val,
                 tags,
                 decay,
                 retrievals,
@@ -2286,6 +2308,8 @@ last_accessed: {}
             let tags_str = get_fm("tags");
             let decay: f64 = get_fm("decay_score").parse().unwrap_or(1.0);
             let layer = get_fm("layer");
+            let workspace_hash_val = get_fm("workspace_hash");
+            let agent_id_val = get_fm("agent_id");
 
             let tags: Vec<String> = if tags_str.is_empty() || tags_str == "[]" {
                 vec![]
@@ -2338,8 +2362,8 @@ last_accessed: {}
                 source: "vault-import".to_string(),
                 always_on: false,
                 certainty: 0.5,
-                workspace_hash: String::new(),
-                agent_id: String::new(),
+                workspace_hash: workspace_hash_val,
+                agent_id: agent_id_val,
                 created_at_unix_ms: now_ms(),
                 last_accessed_unix_ms: now_ms(),
                 embedding: None,

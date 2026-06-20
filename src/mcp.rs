@@ -1596,6 +1596,54 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "annotations": {
       "destructiveHint": true
     }
+  },
+  {
+    "name": "mimir_federate",
+    "description": "Federate entities from one workspace to another. Exports entities scoped to from_workspace, remaps their workspace_hash to to_workspace, and imports them — effectively copying or moving knowledge between workspaces. Use this for cross-agent or cross-project knowledge sharing without manual file transfer.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_workspace": {
+          "type": "string",
+          "description": "Source workspace hash to export entities from"
+        },
+        "to_workspace": {
+          "type": "string",
+          "description": "Target workspace hash to import entities into"
+        },
+        "vault_dir": {
+          "type": "string",
+          "default": "/tmp/mimir-federate",
+          "description": "Temporary vault directory for the intermediate .md export files"
+        }
+      },
+      "required": ["from_workspace", "to_workspace"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "exported": {
+          "type": "integer",
+          "description": "Number of entities exported from the source workspace"
+        },
+        "remapped": {
+          "type": "integer",
+          "description": "Number of entities whose workspace_hash was remapped"
+        },
+        "imported": {
+          "type": "integer",
+          "description": "Number of entities imported into the target workspace"
+        },
+        "import_errors": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Any errors encountered during import"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
   }
 ]"###
     ).expect("tools JSON must be valid");
@@ -1659,6 +1707,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
         "mimir_reindex" => Ok(tools::handle_reindex(db, args)),
+        "mimir_federate" => tools::handle_federate(db, args).map_err(|e| e.to_string()),
         "mimir_workspace_list" => Ok(tools::handle_workspace_list(db)),
         "mimir_recall_when" => tools::handle_recall_when(db, args).map_err(|e| e.to_string()),
         "mimir_cohere" => tools::handle_cohere(db, args).map_err(|e| e.to_string()),

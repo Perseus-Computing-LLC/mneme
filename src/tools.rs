@@ -738,6 +738,8 @@ pub fn handle_context(db: &Database, args: Value) -> String {
 #[derive(Debug, Deserialize)]
 pub struct VaultExportArgs {
     pub vault_dir: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
 }
 
 pub fn handle_vault_export(db: &Database, args: Value) -> String {
@@ -755,7 +757,7 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
     } else {
         a.vault_dir.clone()
     };
-    match db.vault_export(&dir) {
+    match db.vault_export(&dir, a.workspace_hash.as_deref()) {
         Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
             json!({"error": format!("Serialization failed: {}", e)}).to_string()
         }),
@@ -931,6 +933,61 @@ pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
         }
         Err(e) => Err(format!("Prune failed: {}", e)),
     }
+}
+
+pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct FederateArgs {
+        from_workspace: String,
+        to_workspace: String,
+        #[serde(default)]
+        vault_dir: String,
+    }
+    let a: FederateArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid federate arguments: {}", e))?;
+
+    let vault_dir = if a.vault_dir.is_empty() {
+        "/tmp/mimir-federate".to_string()
+    } else {
+        a.vault_dir
+    };
+
+    // Export from source workspace
+    let export_report = db.vault_export(&vault_dir, Some(&a.from_workspace))
+        .map_err(|e| format!("Federate export failed: {}", e))?;
+
+    // Remap entities: overwrite workspace_hash to target
+    let mut remapped = 0i64;
+    for entry in std::fs::read_dir(&vault_dir).map_err(|e| format!("Read vault dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("Read entry: {}", e))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Read {}: {}", path.display(), e))?;
+        let remapped_content =
+            content.replace(&format!("workspace_hash: {}", a.from_workspace),
+                            &format!("workspace_hash: {}", a.to_workspace));
+        if remapped_content != content {
+            std::fs::write(&path, remapped_content)
+                .map_err(|e| format!("Write {}: {}", path.display(), e))?;
+            remapped += 1;
+        }
+    }
+
+    // Import into target workspace
+    let import_report = db.vault_import(&vault_dir)
+        .map_err(|e| format!("Federate import failed: {}", e))?;
+
+    let result = json!({
+        "exported": export_report.files_created + export_report.files_updated,
+        "remapped": remapped,
+        "imported": import_report.files_created + import_report.files_updated,
+        "import_errors": import_report.errors,
+    });
+    Ok(result.to_string())
 }
 
 pub fn handle_workspace_list(db: &Database) -> String {
