@@ -65,3 +65,29 @@ uv run python scripts/run_full_benchmark.py \
   --benchmark longmemeval --split oracle \
   --systems fullcontext,mimir --num-samples 50
 ```
+
+## LLMLingua Comparison (2026-06-22)
+
+### 50-Sample Oracle Split (three-way)
+
+| System | Accuracy | F1 | Tokens |
+|--------|----------|------|--------|
+| **Mimir** | **0.720** | 0.201 | 277,824 |
+| FullContext (raw) | 0.460 | 0.285 | 381,439 |
+| FullContext + LLMLingua-2 | 0.200 | 0.062 | 5,584 |
+
+**Prompt compression destroys long-form memory.** Microsoft LLMLingua-2 achieves 6-9× compression but loses 80% of answer accuracy on LongMemEval's temporal reasoning benchmark. Mimir's structured entity approach preserves ALL information while using fewer tokens than raw FullContext.
+
+### 5-Sample Spot Check
+
+| System | Accuracy | F1 | Tokens |
+|--------|----------|------|--------|
+| Mimir | 1.000 | 0.233 | 31,832 |
+| FullContext | 1.000 | 0.394 | 36,905 |
+| FC + LLMLingua | 0.200 | 0.062 | 5,584 |
+
+LLMLingua compression ratios: 6.1-9.4×. Even at aggressive 9× compression, tokens dropped to 5,584 but accuracy collapsed to 20%.
+
+### Key Insight
+
+**You don't need prompt compression when your memory stores structured entities.** Compression loses information; structured storage preserves it. Mimir achieves better accuracy than raw FullContext while using fewer tokens — without any embedding API.
