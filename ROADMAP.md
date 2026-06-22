@@ -184,6 +184,215 @@ were skipped — v1.0.0 includes everything planned through v0.5 plus more).
 
 ---
 
+## v2.1 — Federated Memory
+
+**Target window:** Q3 2027 (Jul–Sep) · **Theme:** "Memory without borders."
+
+- Cross-instance entity sync with configurable merge strategies (last-write-wins, CRDT-inspired, manual)
+- Bidirectional `mimir_federate`: push and pull between any two Mimir instances
+- Federation namespace scoping — sync only `category=X` or `workspace_hash=Y`
+- Federation health dashboard: sync lag, conflict rate, entity drift
+- Peer discovery: instances announce themselves on a local network or configured registry
+
+---
+
+## v2.2 — Memory Tiering
+
+**Target window:** Q4 2027 (Oct–Dec) · **Theme:** "Infinite memory, finite resources."
+
+- Hot/warm/cold storage tiers with automatic promotion/demotion
+- Hot: SQLite (entities accessed in last 7 days, full-text indexed, <10ms recall)
+- Warm: SQLite (entities 7-90 days, compressed body_json, <50ms recall)
+- Cold: archive files on disk or object storage (>90 days, indexed metadata, <500ms recall)
+- Transparent to agents — same MCP tools, documented latency per tier
+- Configurable tier policies: per-category, per-workspace, per-entity-type
+- `mimir_tier_stats` tool: size, entity count, access patterns per tier
+
+---
+
+## v2.3 — Memory Deduplication at Scale
+
+**Target window:** Q1 2028 (Jan–Mar) · **Theme:** "One truth, many sources."
+
+- Cross-workspace entity deduplication: collapse duplicate facts into canonical entities
+- Dedup strategies: exact match, semantic near-match (embedding distance), key collision
+- `mimir_dedup` tool with dry-run preview before merging
+- Canonical entity carries highest-quality metadata (highest certainty, most recent update)
+- Provenance links back to all source entities that were merged
+- Dedup dashboard: duplicate rate, merge history, entity quality distribution
+
+---
+
+## v2.4 — Streaming Memory & Real-Time Sync
+
+**Target window:** Q2 2028 (Apr–Jun) · **Theme:** "Memory that moves at the speed of thought."
+
+- WebSocket and SSE transports for real-time memory updates
+- Agents subscribe to entity changes: `mimir_subscribe(category="decision")`
+- Push on write: Mimir notifies subscribers immediately, no polling
+- CRDT-based sync between Mimir instances for offline-first multi-agent collaboration
+- Sync topologies: mesh, hub-and-spoke, hierarchical
+- Sync dashboard: per-instance lag, conflict rate, bandwidth usage
+
+---
+
+## v3.0 — Proactive Recall Engine
+
+**Target window:** Q3 2028 (Jul–Sep) · **Theme:** "Mimir remembers so you don't have to."
+
+- Mimir pushes relevant memories into context on session start — doesn't wait to be asked
+- Semantic relevance scoring against task description with confidence calibration
+- `recall_when` trigger system becomes the primary interface — context-aware, not keyword-dependent
+- Pre-fetch on task start: query the task description, push top-N related entities before the first tool call
+- Relevance feedback loop: agents signal whether pushed memories were useful; recall quality improves over time
+- Configurable push budgets: max entities per session, per category, per confidence threshold
+
+---
+
+## v3.1 — Memory Synthesis Pipeline
+
+**Target window:** Q4 2028 (Oct–Dec) · **Theme:** "Insight, not just recall."
+
+- Pattern detection across entities: repeated decisions, recurring bugs, evolving approaches
+- Temporal synthesis: "Over the last 3 months, your error handling has shifted from try/catch to Result types"
+- `mimir_synthesize` tool: NL question → LLM-drafted insight → cited back to entity IDs
+- Every synthesized claim links to its source entities — no uncited generation
+- Synthesis cache: expensive synthesis runs once, reused across sessions with TTL
+- Synthesis quality scoring: agents rate synthesized insights for accuracy and usefulness
+
+---
+
+## v3.2 — Forgetting Curves That Learn
+
+**Target window:** Q1 2029 (Jan–Mar) · **Theme:** "Not all memories fade at the same rate."
+
+- Ebbinghaus decay parameters self-tune per workspace, per agent, per entity type
+- Some facts decay fast (yesterday's error message); some never decay (production password policy)
+- Mimir learns which is which from retrieval patterns, agent corrections, and entity type
+- `mimir_decay_policy` tool: inspect and override learned decay curves
+- Decay dashboards: which entity types decay fastest? Which are sticky? Where is decay misconfigured?
+- Adaptive retention: entities that keep getting retrieved slow their decay; entities that are ignored accelerate
+
+---
+
+## v3.3 — Causal Memory Graphs
+
+**Target window:** Q2 2029 (Apr–Jun) · **Theme:** "Not just what happened, but why."
+
+- Entities linked by causation: "Decision X caused bug Y which was fixed by PR Z"
+- `mimir_traverse` follows causal chains in both directions: "what caused this?" and "what did this cause?"
+- Automatic causal link detection: when entity B references entity A in the same session, suggest a causal link
+- Causal graph visualization in the web dashboard
+- Causal debug: "Why is this module structured this way? → follows chain back to the original architecture decision"
+- Causal integrity: breaking a causal chain (deleting an entity) surfaces warnings about orphaned effects
+
+---
+
+## v4.0 — Mimir as a Protocol
+
+**Target window:** Q3 2029 (Jul–Sep) · **Theme:** "Memory is bigger than one implementation."
+
+- The Mimir entity model becomes an open, versioned standard with a formal specification
+- Reference implementation (the Rust binary) + compliance test suite
+- Anyone can implement a Mimir-compatible memory server in any language
+- MCP tools remain the standard interface; storage format is documented and stable
+- Protocol version negotiation: a v4.0 client talks to a v4.2 server
+- Compliance certification: "Mimir Compatible" badge for third-party implementations
+
+---
+
+## v4.1 — Multi-Modal Memory
+
+**Target window:** Q4 2029 (Oct–Dec) · **Theme:** "Not everything worth remembering is text."
+
+- Store image embeddings, audio transcripts, code diffs — same entity model, same MCP tools
+- `mimir_remember` accepts binary payloads with automatic embedding generation
+- Cross-modal recall: "find the diagram about the auth flow" matches an image entity
+- Modality-specific preview: thumbnails for images, playback metadata for audio, syntax highlighting for code
+- Multi-modal embedding pipeline: ONNX for text, CLIP for images, Whisper for audio
+- Modality filtering: `mimir_recall(modality="image")` scopes results
+
+---
+
+## v4.2 — Memory Compaction Pipelines
+
+**Target window:** Q1 2030 (Jan–Mar) · **Theme:** "Millions of memories, zero clutter."
+
+- Long-running projects accumulate millions of entities; compaction pipeline keeps the working set small
+- Automatic summarization: N related entities → 1 synthesis entity (cited, reversible)
+- Configurable compaction policies: by age, category, retrieval frequency
+- Compaction is reversible — archives are queryable, just slower
+- Working set target: ~10K entities in hot storage regardless of total stored
+- `mimir_compact --strategy aggressive` for disk-constrained deployments
+- Compaction preview: "This policy would archive 45,000 entities and keep 8,200 hot. Proceed?"
+
+---
+
+## v4.3 — Real-Time Memory Sync (Production)
+
+**Target window:** Q2 2030 (Apr–Jun) · **Theme:** "Memory without borders, without latency."
+
+- Production-grade CRDT sync across WAN (builds on v2.4 foundations)
+- Vector clocks for causal ordering; automatic conflict resolution with manual override
+- Sync topologies: mesh, hub-and-spoke, hierarchical — all production-hardened
+- Bandwidth-aware: differential sync sends only changed entities
+- Offline-first: agents work disconnected; sync automatically on reconnect with conflict resolution
+- Sync SLAs: <1s propagation within region, <5s cross-region
+
+---
+
+## v5.0 — Mimir Global
+
+**Target window:** Q3 2030 (Jul–Sep) · **Theme:** "A memory fabric for the planet."
+
+- Global distributed memory fabric: agents anywhere remember facts anywhere
+- Namespaced, encrypted, permissioned — universally accessible with the right keys
+- Edge nodes: Mimir instances close to where agents run, syncing to regional hubs
+- Latency SLAs: <10ms recall for hot entities, <100ms for warm, <1s for cold
+- Global deduplication: a fact remembered in Tokyo is deduped against a fact in London
+- Multi-region deployment: run your own regional hubs or use Mimir Cloud's
+
+---
+
+## v5.1 — Organizational Memory
+
+**Target window:** Q4 2030 (Oct–Dec) · **Theme:** "What your company knows."
+
+- Companies run Mimir clusters as organizational infrastructure
+- Every employee's agent sessions contribute to a shared, permissioned memory
+- Organizational memory graph: who knows what, which teams make which decisions
+- Role-based access: some memories are public, some are team-private, some are individual
+- "What did we learn from the last incident?" is a query, not a meeting
+- Knowledge silo detection: "Team A and Team B have made conflicting decisions about API auth"
+
+---
+
+## v5.2 — Memory Analytics
+
+**Target window:** Q1 2031 (Jan–Mar) · **Theme:** "Your memory has a story to tell."
+
+- Dashboards over organizational memory: trends, conflicts, revisitations
+- "Your team has made 47 decisions about API design in the last year. 12 conflict."
+- Predictive analytics: "Based on memory patterns, you'll revisit auth architecture within 2 weeks"
+- Knowledge coverage maps: which topics are well-documented in memory? Which are sparse?
+- Memory health scoring: recall quality, entity freshness, conflict rate, synthesis accuracy
+- Export to BI tools: Mimir as a data source for organizational intelligence
+
+---
+
+## v5.3 — Memory Interop Standard
+
+**Target window:** Q2 2031 (Apr–Jun) · **Theme:** "The SQL of agent memory."
+
+- Mimir's entity model published as an IETF RFC or equivalent standards body document
+- Memory portability between vendors: move your agent's memories from Mimir to any compliant server
+- Compliance test suite: any server can prove it's Mimir-compatible
+- Reference implementation remains the Rust binary; protocol is the standard
+- "Mimir Compatible" certification program for third-party implementations
+- The standard is the moat — Mimir the product is the best implementation of the standard it created
+
+---
+
 ## Design Principles
 
 1. **Zero runtime dependencies.** The binary is self-contained.
