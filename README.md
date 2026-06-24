@@ -6,11 +6,11 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
-[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/Perseus-Computing-LLC/mimir/releases)
+[![Version](https://img.shields.io/badge/version-2.1.0-green.svg)](https://github.com/Perseus-Computing-LLC/mimir/releases)
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-36-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-40-brightgreen)]()
 
 Mimir is a single Rust binary that gives AI agents durable memory across sessions.
 **One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory
@@ -66,7 +66,7 @@ local-first, zero-dependency, AND agent-first.
 |---|---|---|---|---|
 | **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
-| **MCP-Native** | ✅ 36 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 40 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -74,7 +74,7 @@ local-first, zero-dependency, AND agent-first.
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 36 | 5 | 8 | 0 |
+| **MCP Tools** | 40 | 5 | 8 | 0 |
 | **GitHub Stars** | ~20 | ~55K | ~15K | ~3K |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
@@ -116,7 +116,7 @@ Each adapter:
 Any MCP-compatible framework works with Mimir directly. See
 [Awesome Mimir](awesome-mimir.md) for the full list.
 
-## 36 MCP Tools
+## 40 MCP Tools
 
 ### Entity CRUD
 | Tool | Description |
@@ -163,6 +163,7 @@ Any MCP-compatible framework works with Mimir directly. See
 | `mimir_prune` | Bulk archive by category, decay threshold, or age. |
 | `mimir_purge` | Permanently delete archived entities + VACUUM. Destructive. |
 | `mimir_cohere` | Autonomous coherence grooming pass — promote, decay, link, archive. |
+| `mimir_autocohere` | Full atomic grooming: cohere → decay → compact in one pass (supports dry-run). |
 | `mimir_compact` | Archive entities below decay threshold. |
 | `mimir_reindex` | Rebuild FTS5 search index from entities table. |
 
@@ -172,6 +173,7 @@ Any MCP-compatible framework works with Mimir directly. See
 | `mimir_score` | Assign quality score (0.0-1.0). |
 | `mimir_conflicts` | Detect near-duplicate entities via trigram similarity. |
 | `mimir_correct` | Structured correction capture for learning from errors. |
+| `mimir_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
 
 ### Vault & Federation
 | Tool | Description |
@@ -179,6 +181,7 @@ Any MCP-compatible framework works with Mimir directly. See
 | `mimir_vault_export` | Export entities to .md files with YAML frontmatter. |
 | `mimir_vault_import` | Import from .md vault directory (idempotent). |
 | `mimir_federate` | Copy entities between workspaces. |
+| `mimir_share` | Share one entity (by category + key) into another workspace, preserving content. |
 | `mimir_workspace_list` | List all distinct entity categories. |
 
 ### Metrics & Ops
@@ -187,6 +190,7 @@ Any MCP-compatible framework works with Mimir directly. See
 | `mimir_stats` | Full DB statistics across all tables. |
 | `mimir_health` | Server and DB health check. |
 | `mimir_bench` | Performance benchmark tracking. |
+| `mimir_maintenance` | DB maintenance: dedup, orphan detection, VACUUM, FTS5 reindex (supports dry-run). |
 | `mimir_synthesize` | LLM session synthesis — extract lessons from transcripts. |
 | `mimir_migrate` | Migrate v0.1.x DB to current schema. |
 
