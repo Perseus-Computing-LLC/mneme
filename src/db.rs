@@ -2065,33 +2065,35 @@ impl Database {
     /// Detect links pointing to archived/deleted entities.
     /// Returns the number of orphan links found.
     pub fn detect_orphan_links(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        // Load all entity ids once and check link targets against an in-memory
+        // set, instead of a COUNT(*) point query per link (which was N+1 — one
+        // query per edge in the whole graph). #209
+        let all_ids: std::collections::HashSet<String> = {
+            let mut id_stmt = self.conn.prepare("SELECT id FROM entities")?;
+            let ids = id_stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+
         let mut orphan_count = 0i64;
         let mut stmt = self.conn.prepare(
-            "SELECT id, links FROM entities WHERE links != '[]'"
+            "SELECT links FROM entities WHERE links != '[]'"
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         for row in rows {
-            let (_entity_id, links_json) = row?;
-            let mut links: Vec<MemoryLink> = serde_json::from_str(&links_json).unwrap_or_default();
+            let links_json = row?;
+            let links: Vec<MemoryLink> = serde_json::from_str(&links_json).unwrap_or_default();
             let original_len = links.len();
-
-            links.retain(|link| {
-                let target_exists: bool = self.conn.query_row(
-                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
-                    params![&link.target_id],
-                    |r| r.get(0),
-                ).unwrap_or(0) > 0;
-                target_exists
-            });
-
-            if links.len() < original_len {
-                orphan_count += (original_len - links.len()) as i64;
-                // For dry_run, we just count. For actual run, we would update the entity.
-                // In this read-only detection function, we don't update.
-            }
+            let live = links
+                .iter()
+                .filter(|link| all_ids.contains(&link.target_id))
+                .count();
+            // Orphans = links whose target no longer exists. (Read-only
+            // detection: we count but don't rewrite the entity.)
+            orphan_count += (original_len - live) as i64;
         }
         Ok(orphan_count)
     }
