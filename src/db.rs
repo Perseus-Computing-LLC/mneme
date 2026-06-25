@@ -3445,6 +3445,9 @@ fn sha256_genesis(event_id: &str, created_at_ms: i64) -> String {
 /// Verify the audit chain by checking that each hash was correctly computed
 /// from the previous entry. Returns the number of entries verified, or an error
 /// describing the first invalid entry.
+// Retained as a callable integrity check (audit chain is written by the journal
+// path) but not yet wired to a CLI/MCP command, so it has no in-crate caller.
+#[allow(dead_code)]
 pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     let mut stmt = db.conn.prepare(
         "SELECT id, audit_hash, created_at_unix_ms FROM journal WHERE audit_hash != '' ORDER BY created_at_unix_ms ASC",
