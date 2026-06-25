@@ -97,7 +97,15 @@ impl Database {
         let conn = Connection::open(path)?;
 
         // Enable WAL for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        // synchronous=NORMAL is durable under WAL (only risks the last txn on an
+        // OS crash) and avoids an fsync per commit — important given recall and
+        // bulk writes. cache_size/mmap_size/temp_store reduce cold-scan cost. (#208)
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; \
+             PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; \
+             PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8000; \
+             PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
+        )?;
 
         // Initialize schema if this is a new database
         schema::initialize_schema(&conn)?;
@@ -695,11 +703,17 @@ impl Database {
                 let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let emb_norms = embs.mapv(|v| v * v).sum_axis(ndarray::Axis(1)).mapv(f32::sqrt);
                 let dots = embs.dot(&q);
-                for i in 0..n {
-                    let denom = q_norm * emb_norms[i];
-                    let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
-                    scored.push((entities.remove(0), sim));
-                }
+                // Consume `entities` in order instead of `remove(0)` per element,
+                // which was O(n^2) — each remove shifts the whole vec down. (#209)
+                scored = entities
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, entity)| {
+                        let denom = q_norm * emb_norms[i];
+                        let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
+                        (entity, sim)
+                    })
+                    .collect();
             }
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(limit);
@@ -2051,33 +2065,35 @@ impl Database {
     /// Detect links pointing to archived/deleted entities.
     /// Returns the number of orphan links found.
     pub fn detect_orphan_links(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        // Load all entity ids once and check link targets against an in-memory
+        // set, instead of a COUNT(*) point query per link (which was N+1 — one
+        // query per edge in the whole graph). #209
+        let all_ids: std::collections::HashSet<String> = {
+            let mut id_stmt = self.conn.prepare("SELECT id FROM entities")?;
+            let ids = id_stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+
         let mut orphan_count = 0i64;
         let mut stmt = self.conn.prepare(
-            "SELECT id, links FROM entities WHERE links != '[]'"
+            "SELECT links FROM entities WHERE links != '[]'"
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         for row in rows {
-            let (_entity_id, links_json) = row?;
-            let mut links: Vec<MemoryLink> = serde_json::from_str(&links_json).unwrap_or_default();
+            let links_json = row?;
+            let links: Vec<MemoryLink> = serde_json::from_str(&links_json).unwrap_or_default();
             let original_len = links.len();
-
-            links.retain(|link| {
-                let target_exists: bool = self.conn.query_row(
-                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
-                    params![&link.target_id],
-                    |r| r.get(0),
-                ).unwrap_or(0) > 0;
-                target_exists
-            });
-
-            if links.len() < original_len {
-                orphan_count += (original_len - links.len()) as i64;
-                // For dry_run, we just count. For actual run, we would update the entity.
-                // In this read-only detection function, we don't update.
-            }
+            let live = links
+                .iter()
+                .filter(|link| all_ids.contains(&link.target_id))
+                .count();
+            // Orphans = links whose target no longer exists. (Read-only
+            // detection: we count but don't rewrite the entity.)
+            orphan_count += (original_len - live) as i64;
         }
         Ok(orphan_count)
     }
