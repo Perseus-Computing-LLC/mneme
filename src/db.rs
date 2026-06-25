@@ -97,7 +97,15 @@ impl Database {
         let conn = Connection::open(path)?;
 
         // Enable WAL for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        // synchronous=NORMAL is durable under WAL (only risks the last txn on an
+        // OS crash) and avoids an fsync per commit — important given recall and
+        // bulk writes. cache_size/mmap_size/temp_store reduce cold-scan cost. (#208)
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; \
+             PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; \
+             PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8000; \
+             PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
+        )?;
 
         // Initialize schema if this is a new database
         schema::initialize_schema(&conn)?;
@@ -695,11 +703,17 @@ impl Database {
                 let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let emb_norms = embs.mapv(|v| v * v).sum_axis(ndarray::Axis(1)).mapv(f32::sqrt);
                 let dots = embs.dot(&q);
-                for i in 0..n {
-                    let denom = q_norm * emb_norms[i];
-                    let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
-                    scored.push((entities.remove(0), sim));
-                }
+                // Consume `entities` in order instead of `remove(0)` per element,
+                // which was O(n^2) — each remove shifts the whole vec down. (#209)
+                scored = entities
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, entity)| {
+                        let denom = q_norm * emb_norms[i];
+                        let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
+                        (entity, sim)
+                    })
+                    .collect();
             }
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(limit);

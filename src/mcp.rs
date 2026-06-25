@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::OnceLock;
 
 use crate::db::Database;
 use crate::tools;
@@ -173,12 +174,13 @@ pub fn handle_request(
                     "text": result_text
                 }]
             });
-            // Copy isError through from the tool handler's result if present
-            if let Some(parsed) = &structured {
-                result["structuredContent"] = parsed.clone();
+            // Copy isError through, then move the parsed value into
+            // structuredContent rather than deep-cloning the whole result (#208).
+            if let Some(parsed) = structured {
                 if let Some(is_err) = parsed.get("isError") {
                     result["isError"] = is_err.clone();
                 }
+                result["structuredContent"] = parsed;
             }
             Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
@@ -198,10 +200,12 @@ pub fn handle_request(
 
 /// Build the tools/list response with all 30 tools including outputSchema and annotations.
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
-    // Tools are defined inline as serde_json::Value for maximum flexibility.
-    // The json!() macro would require the exact structure at compile time,
-    // but since we have 30 tools with nested outputSchema, we parse from a string.
-    let tools_json: serde_json::Value = serde_json::from_str(
+    // The tool registry is a compile-time constant. Parse it exactly once per
+    // process and reuse the cached Value instead of re-parsing ~1.8k lines of
+    // JSON on every tools/list request (perf review #208).
+    static TOOLS: OnceLock<serde_json::Value> = OnceLock::new();
+    let tools_json = TOOLS.get_or_init(|| {
+        serde_json::from_str::<serde_json::Value>(
         r###"[
   {
     "name": "mimir_remember",
@@ -2038,13 +2042,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       "destructiveHint": true
     }
   }]"###
-    ).expect("tools JSON must be valid");
+        ).expect("tools JSON must be valid")
+    });
 
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
         result: Some(json!({
-            "tools": tools_json
+            "tools": tools_json.clone()
         })),
         error: None,
     }
