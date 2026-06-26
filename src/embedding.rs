@@ -177,26 +177,64 @@ pub fn generate_embedding(
 
 // ─── Native ort backend (feature = "bundled-embeddings") ─────────────────
 
+/// A loaded ONNX model + its tokenizer, cached for the process lifetime so the
+/// ~80MB graph and tokenizer.json are not re-loaded on every embedding call
+/// (#208). `Session::run` takes `&mut self` (rc.12), so the session is behind a
+/// Mutex; the tokenizer's `encode` takes `&self` and is shared directly.
+#[cfg(feature = "bundled-embeddings")]
+struct OrtModel {
+    session: std::sync::Mutex<ort::session::Session>,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+/// Return the process-cached model for `config.model_path`, loading + caching it
+/// on first use. Keyed by path so a reconfigured model loads fresh rather than
+/// reusing a stale one; entries live for the process lifetime. The cold load
+/// runs under the map lock so two cold callers don't both build the graph. (#208)
+#[cfg(feature = "bundled-embeddings")]
+fn cached_ort_model(
+    config: &EmbeddingConfig,
+) -> Result<std::sync::Arc<OrtModel>, Box<dyn std::error::Error>> {
+    use ort::session::Session;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<OrtModel>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache
+        .lock()
+        .map_err(|_| "embedding model cache mutex poisoned")?;
+    if let Some(model) = map.get(&config.model_path) {
+        return Ok(Arc::clone(model));
+    }
+
+    let model_dir = config
+        .model_path
+        .parent()
+        .ok_or("model_path must have a parent directory")?;
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let session = Session::builder()?.commit_from_file(&config.model_path)?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| format!("failed to load tokenizer: {}", e))?;
+    let model = Arc::new(OrtModel {
+        session: Mutex::new(session),
+        tokenizer,
+    });
+    map.insert(config.model_path.clone(), Arc::clone(&model));
+    Ok(model)
+}
+
 #[cfg(feature = "bundled-embeddings")]
 fn generate_with_ort(
     config: &EmbeddingConfig,
     text: &str,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    use ort::session::Session;
+    // #208: reuse the cached session + tokenizer instead of rebuilding (loading
+    // the ~80MB ONNX graph + parsing tokenizer.json) on every call.
+    let model = cached_ort_model(config)?;
 
-    let model_dir = config
-        .model_path
-        .parent()
-        .expect("model_path must have a parent directory");
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    // rc.12: Session::run takes &mut self.
-    let mut session = Session::builder()?.commit_from_file(&config.model_path)?;
-
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| format!("failed to load tokenizer: {}", e))?;
-
-    let encoding = tokenizer
+    let encoding = model
+        .tokenizer
         .encode(text, true)
         .map_err(|e| format!("tokenization failed: {}", e))?;
 
@@ -217,7 +255,12 @@ fn generate_with_ort(
     let mask_tensor = ort::value::TensorRef::from_array_view(&mask_2d)?;
 
     // ort 2.0.0-rc.12: `inputs!` yields the inputs directly (no longer a Result),
-    // so there is no inner `?`. (#212)
+    // so there is no inner `?`. Lock the cached session for the run; the guard is
+    // held through output extraction below (outputs borrow the session). (#212/#208)
+    let mut session = model
+        .session
+        .lock()
+        .map_err(|_| "embedding session mutex poisoned")?;
     let outputs = session.run(ort::inputs![
         "input_ids" => input_tensor,
         "attention_mask" => mask_tensor,
