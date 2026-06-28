@@ -147,7 +147,13 @@ def main():
     ap.add_argument("--bin", default=None)
     ap.add_argument("--max-instances", type=int, default=0, help="0 = all 500")
     ap.add_argument("--k", nargs="+", type=int, default=[1, 3, 5, 10])
-    ap.add_argument("--modes", nargs="+", default=["fts5", "dense", "hybrid"])
+    ap.add_argument("--modes", nargs="+", default=["fts5", "dense", "hybrid"],
+                    help="Search modes. Use 'auto' to send an empty mode and exercise "
+                         "#271's auto-selection (the real default user experience).")
+    ap.add_argument("--skip-explicit-embed", action="store_true",
+                    help="Do not call mimir_embed; rely on #271 auto-embed-on-write. "
+                         "Combined with mode 'auto', this is exactly what a user gets "
+                         "from a bare remember + recall.")
     ap.add_argument("--limit", type=int, default=10, help="Sessions requested per query")
     ap.add_argument("--out", default=str(HERE / "report.json"))
     args = ap.parse_args()
@@ -197,14 +203,19 @@ def main():
                 })
             n_sessions_total += len(sessions)
 
-            # 2. Embed (bundled ONNX, offline) for dense/hybrid.
-            srv.call("mimir_embed", {"batch_category": qid, "batch_limit": 1000})
+            # 2. Embed (bundled ONNX, offline) for dense/hybrid. With #271 every
+            # write already auto-embeds, so --skip-explicit-embed measures the
+            # bare remember+recall path real users actually hit.
+            if not args.skip_explicit_embed:
+                srv.call("mimir_embed", {"batch_category": qid, "batch_limit": 1000})
 
             # 3. Query per mode, score session-level recall.
             row = {"question_id": qid, "question_type": qtype, "evidence": evidence, "modes": {}}
             for mode in args.modes:
+                # "auto" sends an empty mode so the server picks per #271.
+                recall_mode = "" if mode == "auto" else mode
                 r = srv.call("mimir_recall", {
-                    "query": question, "mode": mode, "category": qid,
+                    "query": question, "mode": recall_mode, "category": qid,
                     "limit": args.limit, "trust_weight": 0, "min_decay": 0,
                 })
                 items = r.get("items", []) if isinstance(r, dict) else []

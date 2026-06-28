@@ -60,22 +60,29 @@ byte-stable per #247).
 ## Results
 
 <!-- RESULTS-START (filled by the latest full run; see report.json for the signed copy) -->
-Full LongMemEval `_s` split: **500 questions, 23,867 sessions, offline, 440s** on
-Windows 11 with the release binary (bundled ONNX embeddings). Signed in `report.json`.
+Full LongMemEval `_s` split: **500 questions, 23,867 sessions, offline** on Windows 11
+with the release binary (bundled ONNX embeddings). Signed in `report.json`.
 
-| mode | recall@1 | recall@3 | recall@5 | recall@10 | MRR |
+This is the **default user experience after #271**: a bare `mimir_remember` then
+`mimir_recall` with no manual `mimir_embed` and no `mode` argument
+(`--skip-explicit-embed --modes auto`). `auto` exercises #271's auto-select; the run
+skips the explicit embed to prove #271's auto-embed-on-write is what populates the
+vectors.
+
+| path | recall@1 | recall@3 | recall@5 | recall@10 | MRR |
 |------|---------:|---------:|---------:|----------:|----:|
-| fts5 (keyword) | 4.2% | 13.0% | 23.6% | 42.0% | 0.126 |
-| dense (semantic) | 77.0% | 90.0% | 93.8% | 97.2% | 0.843 |
-| **hybrid (RRF)** | **82.2%** | **93.4%** | **97.0%** | **98.6%** | **0.884** |
+| keyword only (fts5) | 4.2% | 13.0% | 23.6% | 42.0% | 0.126 |
+| **default (auto, post-#271)** | **82.2%** | **93.4%** | **97.0%** | **98.6%** | **0.884** |
+| hybrid (explicit) | 82.2% | 93.4% | 97.0% | 98.6% | 0.884 |
 
-**The headline:** keyword search alone finds the right session only 4% of the time
-at rank 1 (LongMemEval paraphrases its questions, so lexical matching fails). Mimir's
-**bundled, offline** semantic + hybrid retrieval lifts that to **82% recall@1 and 97%
-recall@5** with no API key, no cloud, no LLM. The whole reason the bundled embedding
-model exists is on display here.
+**The headline:** before #271 a bare remember+recall fell back to keyword search, which
+finds the right session only **4%** of the time at rank 1 (LongMemEval paraphrases its
+questions). #271 makes auto-embed-on-write + hybrid the default, so the same bare calls
+now hit **82% recall@1 / 97% recall@5** with no API key, no cloud, no LLM, and no manual
+step. `auto` == `hybrid` to the digit, confirming the default now equals the ceiling.
+(Standalone dense, measured separately with explicit embed, is 77.0% / 93.8%.)
 
-By question type (hybrid recall@1 / recall@5):
+By question type (default/auto recall@1 / recall@5):
 
 | question type | n | recall@1 | recall@5 |
 |---|--:|--:|--:|
@@ -86,8 +93,10 @@ By question type (hybrid recall@1 / recall@5):
 | single-session-preference | 30 | 63.3% | 93.3% |
 | single-session-user | 70 | 61.4% | 91.4% |
 
-Reproduce: `python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json`
-(signature `f82bee43...`; deterministic run-to-run).
+Reproduce the default experience:
+`python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json --skip-explicit-embed --modes auto fts5`
+(signature `093d556f...`; deterministic run-to-run). Drop the flags to also measure the
+explicit dense/hybrid modes.
 <!-- RESULTS-END -->
 
 ## Stage 2: QA accuracy (answer generation + LongMemEval's official judge)
