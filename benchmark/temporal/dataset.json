@@ -1,0 +1,43 @@
+{
+  "name": "mimir-temporal-mini",
+  "description": "Fact-update scenarios for the bi-temporal benchmark. Each entry records a fact that is later overwritten with new content under the same (category, key). The harness writes v1, marks a mid timestamp, writes v2, then checks that as-of time-travel returns the version that was live at a given instant and that current recall is live-only. v1_token / v2_token are substrings unique to each version; probe is a keyword present across versions.",
+  "version": 1,
+  "updates": [
+    {
+      "category": "facts",
+      "key": "germany-capital",
+      "v1": "Bonn served as the capital of West Germany until reunification.",
+      "v2": "Berlin is the capital of the reunified Federal Republic of Germany.",
+      "probe": "capital",
+      "v1_token": "Bonn",
+      "v2_token": "Berlin"
+    },
+    {
+      "category": "profile",
+      "key": "employer",
+      "v1": "I currently work as a backend engineer at a fintech startup.",
+      "v2": "I now work as a staff engineer at a robotics company.",
+      "probe": "engineer",
+      "v1_token": "fintech",
+      "v2_token": "robotics"
+    },
+    {
+      "category": "config",
+      "key": "primary-model",
+      "v1": "The default model for the agent is claude-opus-4-7.",
+      "v2": "The default model for the agent is claude-opus-4-8.",
+      "probe": "default model",
+      "v1_token": "opus-4-7",
+      "v2_token": "opus-4-8"
+    },
+    {
+      "category": "prefs",
+      "key": "commute",
+      "v1": "I usually bike to the office on weekdays.",
+      "v2": "I take the train to the office now that I moved further away.",
+      "probe": "commute office",
+      "v1_token": "bike",
+      "v2_token": "train"
+    }
+  ]
+}

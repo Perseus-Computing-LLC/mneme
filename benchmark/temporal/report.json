@@ -1,0 +1,136 @@
+{
+  "benchmark": "mimir-bi-temporal",
+  "dataset": "mimir-temporal-mini",
+  "n_scenarios": 4,
+  "checks_total": 20,
+  "checks_passed": 20,
+  "accuracy": 1.0,
+  "by_check": {
+    "as_of_mid_returns_v1": {
+      "pass": 4,
+      "total": 4
+    },
+    "as_of_now_returns_v2": {
+      "pass": 4,
+      "total": 4
+    },
+    "as_of_before_not_found": {
+      "pass": 4,
+      "total": 4
+    },
+    "recall_excludes_superseded_v1": {
+      "pass": 4,
+      "total": 4
+    },
+    "recall_includes_live_v2": {
+      "pass": 4,
+      "total": 4
+    }
+  },
+  "binary": "mimir.exe",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "offline": true,
+  "signature_sha256": "009c4c3e25cbfa7aaa0c25a1873e9110ab5bf14c86cb5872499eff70ff167d7e",
+  "results": [
+    {
+      "scenario": "germany-capital",
+      "check": "as_of_mid_returns_v1",
+      "ok": true
+    },
+    {
+      "scenario": "germany-capital",
+      "check": "as_of_now_returns_v2",
+      "ok": true
+    },
+    {
+      "scenario": "germany-capital",
+      "check": "as_of_before_not_found",
+      "ok": true
+    },
+    {
+      "scenario": "germany-capital",
+      "check": "recall_excludes_superseded_v1",
+      "ok": true
+    },
+    {
+      "scenario": "germany-capital",
+      "check": "recall_includes_live_v2",
+      "ok": true
+    },
+    {
+      "scenario": "employer",
+      "check": "as_of_mid_returns_v1",
+      "ok": true
+    },
+    {
+      "scenario": "employer",
+      "check": "as_of_now_returns_v2",
+      "ok": true
+    },
+    {
+      "scenario": "employer",
+      "check": "as_of_before_not_found",
+      "ok": true
+    },
+    {
+      "scenario": "employer",
+      "check": "recall_excludes_superseded_v1",
+      "ok": true
+    },
+    {
+      "scenario": "employer",
+      "check": "recall_includes_live_v2",
+      "ok": true
+    },
+    {
+      "scenario": "primary-model",
+      "check": "as_of_mid_returns_v1",
+      "ok": true
+    },
+    {
+      "scenario": "primary-model",
+      "check": "as_of_now_returns_v2",
+      "ok": true
+    },
+    {
+      "scenario": "primary-model",
+      "check": "as_of_before_not_found",
+      "ok": true
+    },
+    {
+      "scenario": "primary-model",
+      "check": "recall_excludes_superseded_v1",
+      "ok": true
+    },
+    {
+      "scenario": "primary-model",
+      "check": "recall_includes_live_v2",
+      "ok": true
+    },
+    {
+      "scenario": "commute",
+      "check": "as_of_mid_returns_v1",
+      "ok": true
+    },
+    {
+      "scenario": "commute",
+      "check": "as_of_now_returns_v2",
+      "ok": true
+    },
+    {
+      "scenario": "commute",
+      "check": "as_of_before_not_found",
+      "ok": true
+    },
+    {
+      "scenario": "commute",
+      "check": "recall_excludes_superseded_v1",
+      "ok": true
+    },
+    {
+      "scenario": "commute",
+      "check": "recall_includes_live_v2",
+      "ok": true
+    }
+  ]
+}
