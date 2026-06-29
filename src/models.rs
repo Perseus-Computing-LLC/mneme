@@ -54,6 +54,8 @@ pub struct Entity {
     #[serde(skip)]
     #[allow(dead_code)]
     pub embedding: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 impl Entity {
@@ -217,6 +219,7 @@ pub struct RecallParams {
     // Kept so the filter can be wired without a signature change.
     #[allow(dead_code)]
     pub visibility: Option<String>,
+    pub include_confidence: bool,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, or hybrid fusion.
@@ -280,6 +283,7 @@ impl Default for RecallParams {
             workspace_hash: None,
             agent_id: None,
             visibility: None,
+            include_confidence: false,
         }
     }
 }

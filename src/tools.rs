@@ -100,6 +100,8 @@ pub struct RecallArgs {
     pub workspace_hash: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub include_confidence: bool,
 }
 
 fn default_halving() -> f64 {
@@ -377,6 +379,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         workspace_hash: a.workspace_hash.clone(),
         agent_id: a.agent_id.clone(),
         visibility: None,
+        include_confidence: a.include_confidence,
     };
 
     let entities = db
@@ -502,6 +505,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             workspace_hash: a.workspace_hash.clone(),
             agent_id: a.agent_id.clone(),
             visibility: None,
+            include_confidence: a.include_confidence,
         };
 
         if let Ok(entities) = db.recall(&params) {

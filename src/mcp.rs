@@ -400,6 +400,11 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "agent_id": {
           "type": "string",
           "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
+        },
+        "include_confidence": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include a normalized confidence score (0.0-1.0) in the recall results."
         }
       },
       "required": [
