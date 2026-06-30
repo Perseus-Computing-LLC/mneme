@@ -6774,6 +6774,7 @@ mod tests {
                 workspace_hash: None,
             agent_id: None,
             visibility: None,
+            layer: None,
             },
         )
         .unwrap();
@@ -6906,6 +6907,7 @@ mod tests {
                     workspace_hash: None,
                     agent_id: None,
                     visibility: None,
+                    layer: None,
                 }) {
                     Ok(_) => {},
                     Err(e) => {
@@ -6968,6 +6970,7 @@ mod tests {
             workspace_hash: ws,
             agent_id: None,
             visibility: None,
+            layer: None,
         };
 
         // Scope to "alpha" — should only see ent_a
@@ -7012,6 +7015,7 @@ mod tests {
             diversity_per_query_share: 0.0, recency_half_life_secs: None, workspace_hash: None,
             agent_id: None,
             visibility: None,
+            layer: None,
         };
         let results = db.recall(&params).unwrap();
         let found = results.iter().find(|e| e.key == "key1").expect("entity recalled");
