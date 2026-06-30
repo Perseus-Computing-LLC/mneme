@@ -10,7 +10,7 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-44-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-46-brightgreen)]()
 
 Mimir is a single Rust binary that gives AI agents durable memory across sessions.
 **One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory
@@ -55,6 +55,23 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_reme
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"Hello"}}}' | mimir serve --db memory.db
 ```
 
+## Works With Every MCP Client
+
+Mimir is a standard MCP **stdio** server — the same `mimir serve` command works
+everywhere. Run `mimir doctor` to validate your install and print this matrix locally.
+
+| Client | Status | Config | 
+|---|---|---|
+| Claude Desktop | ✅ | `claude_desktop_config.json` |
+| Claude Code / Hermes | ✅ | `.mcp.json` / `config.yaml` |
+| Cursor | ✅ | `.cursor/mcp.json` |
+| Windsurf | ✅ | `mcp_config.json` |
+| VS Code + Continue.dev | ✅ | `config.json` |
+| Zed | ✅ | `settings.json` |
+| Codex CLI | ✅ | `~/.codex/config.toml` |
+
+Copy-paste config snippets for each: **[docs/clients/](docs/clients/)**.
+
 ## Why Mimir
 
 Mimir is the **only** memory engine that is simultaneously MCP-native,
@@ -66,7 +83,7 @@ local-first, zero-dependency, AND agent-first.
 |---|---|---|---|---|
 | **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
-| **MCP-Native** | ✅ 44 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 46 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -74,7 +91,7 @@ local-first, zero-dependency, AND agent-first.
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 44 | 5 | 8 | 0 |
+| **MCP Tools** | 46 | 5 | 8 | 0 |
 | **GitHub Stars** | ~20 | ~55K | ~15K | ~3K |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
@@ -116,16 +133,18 @@ Each adapter:
 Any MCP-compatible framework works with Mimir directly. See
 [Awesome Mimir](awesome-mimir.md) for the full list.
 
-## 44 MCP Tools
+## 46 MCP Tools
 
 ### Entity CRUD
 | Tool | Description |
 |---|---|
 | `mimir_remember` | Store/update entity. Idempotent by (category, key); a content change snapshots the prior version into history. |
 | `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. |
+| `mimir_recall_layer` | Recall from a specific biomimetic layer (world, episodic, semantic). |
 | `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
 | `mimir_get_entity` | Fetch one entity by ID with full `body_json`. |
 | `mimir_as_of` | Bi-temporal time-travel: the version of a fact (category + key) that was live at a past instant. |
+| `mimir_history` | List every superseded version of a fact (category + key), newest first — the full version trail (companion to `mimir_as_of`). |
 | `mimir_forget` | Soft-delete (archived=1). |
 
 ### Search & RAG
@@ -332,8 +351,16 @@ stale memories fade — your knowledge base stays yours and stays fresh.
 - **Dense vector search** via cosine similarity on stored embeddings
 - **Reciprocal Rank Fusion (RRF)** — combine keyword + vector results
 - **Query expansion** — automatic stemming variants for broader recall
-
 ### Memory Lifecycle
+
+Mimir models memory using three biomimetic layers, inspired by human memory pathways:
+
+- **World (Core):** Slow-decaying, global facts about the environment.
+- **Episodic (Buffer):** Fast-decaying, session-specific interaction history.
+- **Semantic (Working):** Medium-decaying, general knowledge and learned concepts.
+
+You can interact with these layers directly using the `mimir_recall_layer` tool or by specifying the `layer` parameter in `mimir_remember`.
+
 - **Ebbinghaus decay** — memories naturally fade unless retrieved (refresh on access)
 - **Layer promotion** — buffer → working → core based on access frequency
 - **Automatic archival** — stale entities archive; purge to permanently delete + VACUUM
@@ -402,6 +429,31 @@ on-premises, classified environments).
 
 Perseus Computing LLC is a US-owned small business. SAM.gov registration in progress.
 NAICS: 541715, 541511, 541512.
+
+## Privacy Policy
+
+Mimir is a **local-first MCP server** — it runs entirely on your machine.
+
+### Data Collection
+- **No data collection.** Mimir does not collect, transmit, or phone home any user data, usage statistics, or telemetry.
+- All data remains in your local SQLite database file.
+
+### Data Usage & Storage
+- All memory entities, journal entries, and state are stored locally in a SQLite database at the path you specify via `--db`.
+- Optional **AES-256-GCM encryption at rest** is available — when enabled, entity bodies are encrypted before storage.
+- No data is shared with Perseus Computing LLC or any third party.
+
+### Third-Party Sharing
+- **None.** Mimir is fully air-gapped by default. No API calls, no cloud services, no external network requests.
+- The optional dense vector embeddings feature uses a locally-compiled model — no external embedding API is called.
+
+### Data Retention
+- You control retention: entities can be soft-deleted (`mimir_forget`), archived (via decay/compact), or permanently purged (`mimir_purge`).
+- No automatic off-machine backup is performed.
+
+### Contact
+- **Email:** privacy@perseus.observer
+- **GitHub:** [Perseus-Computing-LLC/mimir](https://github.com/Perseus-Computing-LLC/mimir)
 
 ## License
 

@@ -5,6 +5,56 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **`layer` filter on `mimir_recall` now actually filters (#269 follow-up).** The
+  `layer` recall parameter was accepted but never applied — `RecallParams.layer`
+  was a dead field. It now filters by biomimetic layer in all three modes:
+  keyword (`fts5_search`) and BM25 (`fts5_bm25_search`) pre-filter in-query, and a
+  mode-agnostic post-filter in `recall()` covers the dense arm of dense/hybrid
+  (which scores vectors without `RecallParams` access). Aliases world/episodic/
+  semantic are normalized to core/buffer/working at the tools layer.
+
+### Added
+- **`mimir_history` tool (code-review follow-up).** The bi-temporal `history_versions`
+  reader (v2.4.0) was complete and tested but no tool exposed it — you could time-travel
+  to one instant via `mimir_as_of` but couldn't list a fact's full version trail. Wired a
+  `mimir_history` tool that returns all superseded versions of a (category, key), newest
+  first. Tool count 45 → **46**; README badge/table/section, `server.json`, and
+  `CLAIMS-AUDIT.md` reconciled (they had drifted to 44/43).
+
+### Removed
+- **Dead `EncryptionManager::decrypt`.** Fully superseded by `decrypt_body` (the
+  legacy/auth-failure-classifying variant); the old method had zero callers and was the
+  exact footgun the security fix replaced. Removed so it can't be reintroduced.
+
+- **`mimir doctor` + verified client compatibility matrix (#272).** New `mimir doctor`
+  subcommand validates the local install (binary path, db path) and prints the MCP
+  stdio config plus a compatibility matrix for Claude Desktop, Claude Code/Hermes,
+  Cursor, Windsurf, VS Code+Continue.dev, Zed, and Codex CLI. Added a "Works With
+  Every MCP Client" table to the README and copy-paste config snippets in
+  `docs/clients/`. Mimir is a standard MCP stdio server, so the same command works
+  everywhere — this documents and self-checks it.
+- **`include_confidence` on `mimir_recall` (#287).** Opt-in (default false): each result
+  gains a normalized `confidence` (0.0–1.0) rolled up from rank, trust (verified/certainty),
+  and decay — a single number for callers/UIs instead of eyeballing raw signals. Purely
+  presentation-layer; ranking math and existing snapshots are unchanged.
+
+### Security
+- **Decryption failures no longer silently return ciphertext.** On an encrypted DB,
+  the read path (`entity_from_row`), FTS reindex, and the history content-change
+  check used `decrypt(...).unwrap_or(raw)`, so any authentication failure — wrong
+  key, or AAD-mismatched / tampered ciphertext (exactly what AES-256-GCM + AAD exist
+  to detect) — was swallowed and the raw ciphertext was returned/indexed as if it
+  were the plaintext body. That nullified the integrity guarantee: an attacker who
+  could write to the DB file could tamper with a body and have it surface
+  undetected. New `EncryptionManager::decrypt_body` classifies the input as
+  decrypted plaintext, a legacy plaintext row (a real JSON body is never valid
+  base64, so mixed DBs still work), or an authentication failure — and read paths
+  now refuse to return the bytes on failure (a clear error sentinel + stderr warning
+  for recall; an empty FTS entry so ciphertext is never indexed). Regression tests
+  cover roundtrip, legacy-plaintext passthrough, and tamper / wrong-AAD / wrong-key
+  rejection.
+
 ## [2.7.0] - 2026-06-28
 
 ### Distribution

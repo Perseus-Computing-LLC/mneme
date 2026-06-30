@@ -38,6 +38,8 @@ pub struct RememberArgs {
     pub agent_id: String,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    #[serde(default)]
+    pub layer: Option<String>,
 }
 
 fn default_certainty() -> f64 {
@@ -100,6 +102,54 @@ pub struct RecallArgs {
     pub workspace_hash: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// #287: opt-in. When true, each result gets a normalized `confidence`
+    /// (0.0–1.0) rolled up from rank, trust, and decay. Default false so
+    /// existing callers and snapshot tests are unaffected; ranking is unchanged.
+    #[serde(default)]
+    pub include_confidence: bool,
+}
+
+/// #287: presentation-layer confidence rollup over signals Mimir already has.
+/// Does NOT affect ranking — purely a convenience score for the caller.
+fn confidence_for(entity: &crate::models::Entity, rank: usize, total: usize) -> f64 {
+    let relevance = if total > 1 {
+        (total - rank) as f64 / total as f64
+    } else {
+        1.0
+    };
+    let trust = if entity.verified {
+        1.0
+    } else {
+        entity.certainty.clamp(0.0, 1.0)
+    };
+    let freshness = entity.decay_score.clamp(0.0, 1.0);
+    let c = 0.5 * relevance + 0.3 * trust + 0.2 * freshness;
+    (c.clamp(0.0, 1.0) * 1000.0).round() / 1000.0
+}
+
+/// Inject a `confidence` field into each already-serialized recall item.
+fn apply_confidence(items: &mut [serde_json::Value], entities: &[crate::models::Entity]) {
+    let total = entities.len();
+    for (i, (item, ent)) in items.iter_mut().zip(entities.iter()).enumerate() {
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("confidence".to_string(), json!(confidence_for(ent, i, total)));
+        }
+    }
+}
+
+/// Map a biomimetic layer alias (world/episodic/semantic) to its canonical
+/// storage layer (core/buffer/working). Any other value passes through, so
+/// callers may also filter by the raw layer name.
+fn canonical_layer(s: &str) -> String {
+    match s {
+        "world" => "core",
+        "episodic" => "buffer",
+        "semantic" => "working",
+        other => other,
+    }
+    .to_string()
 }
 
 fn default_halving() -> f64 {
@@ -287,6 +337,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
     let now = now_ms();
 
+    let layer = a.layer.map(|l| match l.as_str() {
+        "world" => "core".to_string(),
+        "episodic" => "buffer".to_string(),
+        "semantic" => "working".to_string(),
+        _ => l,
+    }).unwrap_or_else(|| "buffer".to_string());
+
     let entity = Entity {
         id,
         category: a.category,
@@ -297,7 +354,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         tags: a.tags,
         decay_score: a.importance,
         retrieval_count: 0,
-        layer: "buffer".to_string(),
+        layer,
         topic_path: a.topic_path,
         archived: false,
         archive_reason: String::new(),
@@ -377,14 +434,19 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         workspace_hash: a.workspace_hash.clone(),
         agent_id: a.agent_id.clone(),
         visibility: None,
+        layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
     };
 
     let entities = db
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
-    let items_expanded: Vec<serde_json::Value> =
+    let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
+
+    if a.include_confidence {
+        apply_confidence(&mut items_expanded, &entities);
+    }
 
     let result = json!({
         "items": items_expanded,
@@ -502,6 +564,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             workspace_hash: a.workspace_hash.clone(),
             agent_id: a.agent_id.clone(),
             visibility: None,
+            layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
         };
 
         if let Ok(entities) = db.recall(&params) {
@@ -529,10 +592,19 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
     let hit_ids: Vec<String> = merged.iter().map(|(e, _)| e.id.clone()).collect();
     let _ = db.apply_recall_side_effects(&hit_ids);
 
-    let items_expanded: Vec<serde_json::Value> = merged
+    let mut items_expanded: Vec<serde_json::Value> = merged
         .iter()
         .map(|(entity, _)| entity.to_json_expanded())
         .collect();
+
+    if a.include_confidence {
+        let total = merged.len();
+        for (i, (item, (entity, _))) in items_expanded.iter_mut().zip(merged.iter()).enumerate() {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("confidence".to_string(), json!(confidence_for(entity, i, total)));
+            }
+        }
+    }
 
     let result = json!({
         "items": items_expanded,
@@ -540,6 +612,33 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
         "variants": variants.len(),
     });
     Ok(result.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecallLayerArgs {
+    pub layer: String,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String> {
+    let a: RecallLayerArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid recall_layer arguments: {}", e))?;
+
+    let layer = match a.layer.as_str() {
+        "world" => "core",
+        "episodic" => "buffer",
+        "semantic" => "working",
+        _ => &a.layer,
+    };
+
+    let recall_args = json!({
+        "query": "",
+        "limit": a.limit,
+        "layer": layer,
+    });
+
+    handle_recall(db, recall_args)
 }
 
 /// #103: Get a single entity by ID with full body (for drill-down after preview cap).
@@ -609,6 +708,32 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
             "as_of_unix_ms": as_of,
         }),
     };
+    Ok(result.to_string())
+}
+
+/// #269/#272 review follow-up: surface the bi-temporal version trail.
+/// `history_versions` existed + was tested but no tool reached it.
+pub fn handle_history(db: &Database, args: Value) -> Result<String, String> {
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing 'category' parameter".to_string())?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing 'key' parameter".to_string())?;
+
+    let versions = db
+        .history_versions(category, key)
+        .map_err(|e| format!("history failed: {}", e))?;
+
+    let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_json_expanded()).collect();
+    let result = json!({
+        "category": category,
+        "key": key,
+        "versions": items,
+        "total": items.len(),
+    });
     Ok(result.to_string())
 }
 

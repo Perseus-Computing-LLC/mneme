@@ -751,9 +751,21 @@ impl Database {
             let mut count = 0usize;
             for (rowid, category, key, raw_body) in rows {
                 let aad = format!("{}:{}", category, key);
-                // Fall back to raw on decrypt failure (e.g. a row written before
-                // encryption was enabled), mirroring entity_from_row.
-                let plain = enc.decrypt(&raw_body, aad.as_bytes()).unwrap_or(raw_body);
+                // Index decrypted text, or a legacy plaintext row. On an
+                // authentication failure (wrong key / tampered), index an empty
+                // body rather than the ciphertext: putting ciphertext into the
+                // plaintext FTS index would both leak it and corrupt search.
+                let plain = match enc.decrypt_body(&raw_body, aad.as_bytes()) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                        eprintln!(
+                            "mimir: reindex skipping body text for {}:{} — decryption {}.",
+                            category, key, e
+                        );
+                        "{}".to_string()
+                    }
+                };
                 insert.execute(params![rowid, plain])?;
                 count += 1;
             }
@@ -897,6 +909,14 @@ impl Database {
     const CORE_THRESHOLD: i64 = 20; // ≥20 retrievals → core
     const WORKING_THRESHOLD: i64 = 5; // ≥5 retrievals → working
 
+    /// Decay floor for verified entities (#298). Curated/verified facts match
+    /// few queries and so are rarely recall-boosted; without a floor they decay
+    /// below the 0.05 auto-archive threshold and are silently forgotten, while
+    /// broad unverified turns that match everything stay hot. A verified entity's
+    /// decay_score never drops below this, so it is never auto-archived by the
+    /// forgetting curve. Well above the 0.05 archive threshold.
+    const VERIFIED_DECAY_FLOOR: f64 = 0.2;
+
     /// Compute Ebbinghaus decay score based on time since last access.
     /// decay = e^(-elapsed_ms / half_life_ms)
     /// Returns value in [0.0, 1.0] where 1.0 = just accessed.
@@ -994,22 +1014,28 @@ impl Database {
         // Update decay_score for non-archived entities, optionally capped
         let sql = if let Some(max) = max_entities {
             format!(
-                "SELECT id, last_accessed_unix_ms FROM entities WHERE archived = 0 LIMIT {}",
+                "SELECT id, last_accessed_unix_ms, verified FROM entities WHERE archived = 0 LIMIT {}",
                 max
             )
         } else {
-            "SELECT id, last_accessed_unix_ms FROM entities WHERE archived = 0".to_string()
+            "SELECT id, last_accessed_unix_ms, verified FROM entities WHERE archived = 0".to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, bool>(2).unwrap_or(false),
+            ))
+        })?;
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
-        let mut batch: Vec<(String, i64)> = Vec::with_capacity(1000);
+        let mut batch: Vec<(String, i64, bool)> = Vec::with_capacity(1000);
         let now_val = now;
 
         // Helper: flush the current batch in a transaction.
-        let flush_batch = |batch: &mut Vec<(String, i64)>,
+        let flush_batch = |batch: &mut Vec<(String, i64, bool)>,
                             updated: &mut i64,
                             auto_archived: &mut i64|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -1017,14 +1043,20 @@ impl Database {
                 return Ok(());
             }
             let tx = conn.unchecked_transaction()?;
-            for (id, last_access) in batch.drain(..) {
-                let new_decay = Self::compute_decay(last_access, now_val);
+            for (id, last_access, verified) in batch.drain(..) {
+                let mut new_decay = Self::compute_decay(last_access, now_val);
+                // #298: verified/curated facts get a decay floor so the
+                // forgetting curve can never auto-archive them.
+                if verified {
+                    new_decay = new_decay.max(Self::VERIFIED_DECAY_FLOOR);
+                }
                 tx.execute(
                     "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
                     params![new_decay, &id],
                 )?;
                 *updated += 1;
-                // Auto-archive entities that have fully decayed (decay < 0.05)
+                // Auto-archive entities that have fully decayed (decay < 0.05).
+                // Verified entities are floored above this and never reach it.
                 if new_decay < 0.05 {
                     tx.execute(
                         "UPDATE entities SET archived = 1, archive_reason = 'decay threshold' WHERE id = ?1 AND archived = 0",
@@ -1043,14 +1075,33 @@ impl Database {
         };
 
         for row in rows {
-            let (id, last_access) = row?;
-            batch.push((id, last_access));
+            let (id, last_access, verified) = row?;
+            batch.push((id, last_access, verified));
             if batch.len() >= 1000 {
                 flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
             }
         }
         // Flush final partial batch
         flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
+
+        // #298: demote cold, non-verified entities so layer is no longer a
+        // one-way ratchet. Layer is otherwise only ever promoted (by retrieval
+        // count on the recall path), so a turn that once went hot stays in
+        // `core` forever. decay_tick is the demotion authority: as an entity's
+        // decay falls (it has stopped being recalled), its layer drops back
+        // toward `buffer`. This only ever LOWERS a layer — promotion stays
+        // recall-count driven — and exempts verified/always-on entities
+        // (curated / pinned). Runs once over the freshly-recomputed decay
+        // scores; pairs with the verified decay floor above.
+        conn.execute(
+            "UPDATE entities SET layer = CASE \
+                WHEN decay_score < 0.2 THEN 'buffer' \
+                WHEN decay_score < 0.5 AND layer = 'core' THEN 'working' \
+                ELSE layer END \
+             WHERE archived = 0 AND verified = 0 AND always_on = 0 \
+               AND layer != 'buffer'",
+            [],
+        )?;
 
         Ok(DecayReport {
             entities_checked: total,
@@ -1268,8 +1319,16 @@ impl Database {
                 .unwrap_or_default();
             let old_plain_body = if let Some(ref enc) = self.encryption {
                 let aad = format!("{}:{}", entity.category, entity.key);
-                enc.decrypt(&old_raw_body, aad.as_bytes())
-                    .unwrap_or_else(|_| old_raw_body.clone())
+                match enc.decrypt_body(&old_raw_body, aad.as_bytes()) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    // Can't authenticate the prior body: do NOT compare against
+                    // ciphertext. Use a sentinel so content_changed is true and we
+                    // conservatively snapshot history.
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        "\u{0}__mimir_undecryptable__".to_string()
+                    }
+                }
             } else {
                 old_raw_body.clone()
             };
@@ -1463,6 +1522,18 @@ impl Database {
     }
 
     /// Search entities with FTS5 + LIKE fallback and optional filters.
+    /// Drop entities whose layer doesn't match `params.layer` (when set). Applied
+    /// post-search so it also covers the dense arm of dense/hybrid recall, which
+    /// scores vectors without access to RecallParams (#269/#272). The keyword
+    /// paths additionally pre-filter in-query (cheaper, pre-limit).
+    fn retain_layer(entities: &mut Vec<Entity>, params: &RecallParams) {
+        if let Some(ref layer) = params.layer {
+            if !layer.is_empty() {
+                entities.retain(|e| e.layer == *layer);
+            }
+        }
+    }
+
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         // Dense vector search path
         if params.mode == crate::models::SearchMode::Dense
@@ -1485,7 +1556,9 @@ impl Database {
             if let Some(query_vec) = query_vec {
                 if params.mode == crate::models::SearchMode::Dense {
                     let dense_results = self.dense_search(query_vec, params.limit as usize)?;
-                    return Ok(dense_results.into_iter().map(|(e, _)| e).collect());
+                    let mut out: Vec<Entity> = dense_results.into_iter().map(|(e, _)| e).collect();
+                    Self::retain_layer(&mut out, params);
+                    return Ok(out);
                 }
 
                 // Hybrid: fuse the dense vectors with a read-only, BM25-ranked,
@@ -1519,12 +1592,16 @@ impl Database {
                     params.recency_half_life_secs,
                     now_ms(),
                 );
-                return Ok(fused.into_iter().map(|(e, _)| e).collect());
+                let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
+                Self::retain_layer(&mut out, params);
+                return Ok(out);
             }
             // Empty query: nothing to embed, fall through to FTS5
         }
 
-        self.fts5_search(params)
+        let mut results = self.fts5_search(params)?;
+        Self::retain_layer(&mut results, params);
+        Ok(results)
     }
 
     /// Core FTS5 + LIKE keyword search (extracted for reuse by recall and hybrid).
@@ -1655,6 +1732,16 @@ impl Database {
         if let Some(ref aid) = params.agent_id {
             conditions.push(format!("agent_id = ?{}", param_values.len() + 1));
             param_values.push(Box::new(aid.clone()));
+        }
+
+        // Filter by biomimetic memory layer (#269/#272): core/buffer/working.
+        // Aliases (world/episodic/semantic) are normalized to canonical layers
+        // by the tools layer before reaching here.
+        if let Some(ref layer) = params.layer {
+            if !layer.is_empty() {
+                conditions.push(format!("layer = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(layer.clone()));
+            }
         }
 
         // Exclude archived unless explicitly requested
@@ -1912,6 +1999,13 @@ impl Database {
         if let Some(ref aid) = params.agent_id {
             conditions.push(format!("e.agent_id = ?{}", param_values.len() + 1));
             param_values.push(Box::new(aid.clone()));
+        }
+        // Biomimetic layer filter (#269/#272): core/buffer/working.
+        if let Some(ref layer) = params.layer {
+            if !layer.is_empty() {
+                conditions.push(format!("e.layer = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(layer.clone()));
+            }
         }
 
         let safe_limit = params.limit.clamp(0, 1000);
@@ -4578,8 +4672,24 @@ fn entity_from_row(
         let cat: String = row.get(1)?;
         let k: String = row.get(2)?;
         let aad = format!("{}:{}", cat, k);
-        enc.decrypt(&raw_body_json, aad.as_bytes())
-            .unwrap_or(raw_body_json) // Fall back to raw if decryption fails (unencrypted DB)
+        match enc.decrypt_body(&raw_body_json, aad.as_bytes()) {
+            // Decrypted ciphertext, or a legacy plaintext row in a mixed DB.
+            crate::encryption::BodyDecrypt::Plaintext(s)
+            | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+            // Authentic-looking ciphertext that failed GCM auth (wrong key or
+            // tampered). Never return the raw ciphertext — that would silently
+            // defeat the AES-256-GCM/AAD integrity guarantee. Surface a sentinel
+            // and warn instead.
+            crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                eprintln!(
+                    "mimir: refusing to return body for {}:{} — decryption {}. \
+                     Wrong key or tampered ciphertext.",
+                    cat, k, e
+                );
+                "{\"error\":\"mimir: body decryption failed (wrong key or tampered ciphertext)\"}"
+                    .to_string()
+            }
+        }
     } else {
         raw_body_json
     };
@@ -4708,6 +4818,115 @@ mod tests {
             hits2.iter().any(|e| e.category == "conversation"),
             "explicit category=conversation must return conversation entities"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decay_tick_floors_verified_and_never_archives_them() {
+        // #298: a verified curated fact and an unverified turn, equally stale.
+        // The verified one must be floored and survive; the unverified one must
+        // fully decay and auto-archive.
+        let (db, path) = temp_db();
+
+        let mut v = make_entity("e-verified", "decision", "curated-fact", r#"{"note":"curated"}"#);
+        v.verified = true;
+        db.remember(&v).unwrap();
+        let u = make_entity("e-unverified", "conversation", "turn-x", r#"{"note":"chatter"}"#);
+        db.remember(&u).unwrap();
+
+        // Backdate both well past the auto-archive horizon (60 days).
+        let stale = now_ms() - 60 * 24 * 60 * 60 * 1000;
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET last_accessed_unix_ms = ?1, decay_score = 1.0",
+                rusqlite::params![stale],
+            )
+            .unwrap();
+        }
+
+        let report = db.decay_tick().unwrap();
+        assert!(report.entities_checked >= 2);
+
+        let read = |cat: &str, key: &str| -> (bool, f64) {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT archived, decay_score FROM entities WHERE category = ?1 AND key = ?2",
+                rusqlite::params![cat, key],
+                |r| Ok((r.get::<_, bool>(0)?, r.get::<_, f64>(1)?)),
+            )
+            .unwrap()
+        };
+
+        let (v_archived, v_decay) = read("decision", "curated-fact");
+        assert!(!v_archived, "verified entity must not be auto-archived by decay");
+        assert!(
+            v_decay >= Database::VERIFIED_DECAY_FLOOR - 1e-9,
+            "verified decay_score {} must respect the floor",
+            v_decay
+        );
+
+        let (u_archived, u_decay) = read("conversation", "turn-x");
+        assert!(u_archived, "stale unverified entity should auto-archive");
+        assert!(
+            u_decay < 0.05,
+            "unverified decay_score {} should be below archive threshold",
+            u_decay
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decay_tick_demotes_cold_unverified_layers_but_not_verified() {
+        // #298: layer is otherwise a one-way ratchet. A cold unverified entity
+        // in `core` must demote as its decay falls; a verified one is exempt
+        // (and floored), so it stays put.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-cold", "general", "cold-fact", r#"{"note":"x"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-kept", "decision", "kept-fact", r#"{"note":"y"}"#))
+            .unwrap();
+
+        // 15 days stale → decay ≈ 0.12: below the 0.2 demotion band, above the
+        // 0.05 archive floor. Both start pinned in `core`.
+        let stale = now_ms() - 15 * 24 * 60 * 60 * 1000;
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET layer='core', last_accessed_unix_ms=?1, decay_score=1.0, verified=0 WHERE category='general'",
+                rusqlite::params![stale],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE entities SET layer='core', last_accessed_unix_ms=?1, decay_score=1.0, verified=1 WHERE category='decision'",
+                rusqlite::params![stale],
+            )
+            .unwrap();
+        }
+
+        db.decay_tick().unwrap();
+
+        let layer_of = |cat: &str, key: &str| -> (String, bool) {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT layer, archived FROM entities WHERE category=?1 AND key=?2",
+                rusqlite::params![cat, key],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
+            )
+            .unwrap()
+        };
+
+        let (cold_layer, cold_archived) = layer_of("general", "cold-fact");
+        assert!(!cold_archived, "decay ~0.12 stays above the 0.05 archive floor");
+        assert_eq!(
+            cold_layer, "buffer",
+            "cold unverified core entity must demote to buffer"
+        );
+
+        let (kept_layer, _) = layer_of("decision", "kept-fact");
+        assert_eq!(kept_layer, "core", "verified entity must not be demoted");
 
         let _ = fs::remove_file(&path);
     }
@@ -6824,6 +7043,7 @@ mod tests {
                 workspace_hash: None,
             agent_id: None,
             visibility: None,
+            layer: None,
             },
         )
         .unwrap();
@@ -6956,6 +7176,7 @@ mod tests {
                     workspace_hash: None,
                     agent_id: None,
                     visibility: None,
+                    layer: None,
                 }) {
                     Ok(_) => {},
                     Err(e) => {
@@ -7018,6 +7239,7 @@ mod tests {
             workspace_hash: ws,
             agent_id: None,
             visibility: None,
+            layer: None,
         };
 
         // Scope to "alpha" — should only see ent_a
@@ -7062,6 +7284,7 @@ mod tests {
             diversity_per_query_share: 0.0, recency_half_life_secs: None, workspace_hash: None,
             agent_id: None,
             visibility: None,
+            layer: None,
         };
         let results = db.recall(&params).unwrap();
         let found = results.iter().find(|e| e.key == "key1").expect("entity recalled");
