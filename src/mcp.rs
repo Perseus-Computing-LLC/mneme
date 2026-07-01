@@ -2712,6 +2712,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     }
 }
 fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> String {
+    // Keep the caller's original (un-normalized) name for error messages —
+    // a "mneme_bogus"/"perseus_vault_bogus" call should say so, not report
+    // back the normalized "mimir_bogus" it was rewritten to below.
+    let original_name = name;
     // Mneme/Perseus Vault rename (transition release): "mneme_*" and
     // "perseus_vault_*" are back-compat aliases for "mimir_*" — normalize
     // whichever prefix is present once here so every match arm below keeps
@@ -2798,7 +2802,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_supersede" => tools::handle_supersede(db, args).map_err(|e| e.to_string()),
         "mimir_maintenance" => tools::handle_maintenance(db, args).map_err(|e| e.to_string()),
 
-        _ => Err(format!("Unknown tool: {}", name)),
+        _ => Err(format!("Unknown tool: {}", original_name)),
     };
 
     // MCP spec §3.3: tool failures must return isError:true in the result,
@@ -2834,6 +2838,28 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> JsonRpcRespons
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn unknown_tool_error_reports_original_unnormalized_name() {
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-unknown-tool-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // A caller using either back-compat prefix should see ITS OWN name in
+        // the error, not the "mimir_*" name it gets normalized to internally.
+        let mneme_result = call_tool("mneme_bogus", &db, json!({}), None);
+        assert!(mneme_result.contains("Unknown tool: mneme_bogus"), "got: {mneme_result}");
+        assert!(!mneme_result.contains("mimir_bogus"), "got: {mneme_result}");
+
+        let vault_result = call_tool("perseus_vault_bogus", &db, json!({}), None);
+        assert!(
+            vault_result.contains("Unknown tool: perseus_vault_bogus"),
+            "got: {vault_result}"
+        );
+        assert!(!vault_result.contains("mimir_bogus"), "got: {vault_result}");
+
+        let _ = fs::remove_file(&db_path);
+    }
 
     #[test]
     fn rejects_non_json_rpc_2_requests() {

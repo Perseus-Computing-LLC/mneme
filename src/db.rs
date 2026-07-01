@@ -102,15 +102,18 @@ impl Default for LlmConfig {
 /// raw auto-captured turns otherwise dominate broad recall and bury curated
 /// facts (#298/#525). Override the list — or disable it entirely with an empty
 /// value — via the `MIMIR_EXCLUDE_CATEGORIES` env var (comma-separated).
-fn excluded_recall_categories() -> Vec<String> {
-    match std::env::var("MIMIR_EXCLUDE_CATEGORIES") {
+fn excluded_recall_categories() -> &'static Vec<String> {
+    // Read once and cache: this runs on every recall() call (twice for hybrid
+    // mode), but the env var never changes within a process's lifetime.
+    static EXCLUDED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXCLUDED.get_or_init(|| match std::env::var("MIMIR_EXCLUDE_CATEGORIES") {
         Ok(v) => v
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect(),
         Err(_) => vec!["conversation".to_string()],
-    }
+    })
 }
 
 impl Database {
@@ -1687,7 +1690,7 @@ impl Database {
         if params.category.as_deref().map_or(true, |c| c.is_empty()) {
             for cat in excluded_recall_categories() {
                 conditions.push(format!("category != ?{}", param_values.len() + 1));
-                param_values.push(Box::new(cat));
+                param_values.push(Box::new(cat.clone()));
             }
         }
 
@@ -1968,7 +1971,7 @@ impl Database {
         if params.category.as_deref().map_or(true, |c| c.is_empty()) {
             for cat in excluded_recall_categories() {
                 conditions.push(format!("e.category != ?{}", param_values.len() + 1));
-                param_values.push(Box::new(cat));
+                param_values.push(Box::new(cat.clone()));
             }
         }
         if let Some(ref t) = params.entity_type {
@@ -4122,9 +4125,34 @@ last_accessed: {}
                     row.get::<_, String>(4)?,
                 ))
             })?;
+            // Same anti-pattern #209 already fixed elsewhere in this file
+            // (find_near_duplicate): e1.id < e2.id makes each entity appear in
+            // up to (category_size - 1) pairs, so calling trigram_similarity()
+            // per pair rebuilt the same entity's trigram HashSet from scratch
+            // every time it showed up. Cache each entity's set the first time
+            // it's seen; still bounded by candidate_budget (<=5000 pairs).
+            let mut trigram_cache: std::collections::HashMap<
+                String,
+                std::collections::HashSet<[char; 3]>,
+            > = std::collections::HashMap::new();
             'link: for row in rows {
                 let (e1_id, e1_links_json, e2_id, body1, body2) = row?;
-                let sim = Self::trigram_similarity(&body1, &body2);
+                // Preserves trigram_similarity's exact semantics (empty ->
+                // 0.0, identical bodies -> 1.0 without building trigram sets
+                // at all) before falling back to the cached overlap.
+                let sim = if body1.is_empty() || body2.is_empty() {
+                    0.0
+                } else if body1 == body2 {
+                    1.0
+                } else {
+                    trigram_cache
+                        .entry(e1_id.clone())
+                        .or_insert_with(|| Self::trigrams(&body1));
+                    trigram_cache
+                        .entry(e2_id.clone())
+                        .or_insert_with(|| Self::trigrams(&body2));
+                    Self::trigram_overlap(&trigram_cache[&e1_id], &trigram_cache[&e2_id])
+                };
                 if sim < Self::AUTO_LINK_SIM_THRESHOLD {
                     continue;
                 }
