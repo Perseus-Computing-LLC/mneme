@@ -734,7 +734,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "limit": {
           "type": "integer",
           "default": 20,
-          "description": "Maximum versions to return (newest first), 0-1000. Defaults to 20."
+          "description": "Maximum versions to return (newest first), 0-1000. Defaults to 20. 0 is count-only: returns no version bodies while `total` still reports the full trail size."
         },
         "offset": {
           "type": "integer",

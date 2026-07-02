@@ -665,9 +665,13 @@ impl Database {
         &self,
         params: &EmbedParams,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let conn = self.conn()?;
         // Batch mode: embed all entities in a category that lack embeddings
         if let Some(ref cat) = params.batch_category {
+            // #397: the connection is scoped to THIS branch. Drawing it for the
+            // whole function meant the single-entity path below held it across
+            // its own self-drawing get_entity/store_embedding calls — a nested
+            // pool draw that deadlocks at >= pool-size concurrent embeds.
+            let conn = self.conn()?;
             let mut stmt = conn.prepare(
                 "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0 AND embedding IS NULL LIMIT ?2",
             )?;
@@ -696,7 +700,10 @@ impl Database {
             }));
         }
 
-        // Single entity mode: require category + key
+        // Single entity mode: require category + key. get_entity and
+        // store_embedding each draw (and return) their own pooled connection
+        // SEQUENTIALLY — at no point are two held at once, so this path is
+        // safe at full pool saturation (#397).
         let category = params.category.as_ref().ok_or("category is required")?;
         let key = params.key.as_ref().ok_or("key is required")?;
         let entity = self
@@ -1479,8 +1486,17 @@ impl Database {
                 // consumer can observe. `updated` therefore counts rows
                 // actually WRITTEN, not rows evaluated (`entities_checked`
                 // still reports the full evaluated count).
+                //
+                // The write is also forced when new/stored straddle a layer
+                // demotion boundary (0.2 / 0.5 — must mirror the layer CASE
+                // below): the demotion UPDATE reads the STORED score, so
+                // skipping a straddling write would delay that row's demotion
+                // until the drift exceeded epsilon.
+                let straddles_layer_boundary = (new_decay < 0.2) != (stored_decay < 0.2)
+                    || (new_decay < 0.5) != (stored_decay < 0.5);
                 let no_op = (new_decay - stored_decay).abs() < Self::DECAY_WRITE_EPSILON
-                    && new_decay >= Self::ARCHIVE_DECAY_THRESHOLD;
+                    && new_decay >= Self::ARCHIVE_DECAY_THRESHOLD
+                    && !straddles_layer_boundary;
                 if !no_op {
                     tx.execute(
                         "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
@@ -7630,6 +7646,76 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// #397 (review follow-up): single-entity embed_entity must never hold one
+    /// pooled connection while get_entity/store_embedding draw another. With a
+    /// ONE-connection pool and a short checkout timeout, any nested draw
+    /// deadlocks-then-times-out — exactly the reviewer's repro (pool=1,
+    /// MIMIR_POOL_TIMEOUT_MS=700 -> single-mode embed timed out in ~714ms).
+    /// The pool is built directly (not via env) so parallel tests are
+    /// unaffected. A missing embedding backend (lean builds) is an acceptable
+    /// error; a pool checkout timeout is the regression.
+    #[test]
+    fn single_mode_embed_entity_does_not_nest_pool_draws() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mimir-test-pool1-{}.db", uuid::Uuid::new_v4()));
+        let path_str = path.to_str().unwrap().to_string();
+        let manager = SqliteConnectionManager::file(&path_str).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            )
+        });
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(700))
+            .build(manager)
+            .expect("pool");
+        let setup = pool.get().expect("setup conn");
+        schema::initialize_schema(&setup).expect("schema");
+        drop(setup);
+        let db = Database {
+            pool,
+            db_path: path_str.clone(),
+            encryption: None,
+            llm_config: LlmConfig::default(),
+            embedding_config: crate::embedding::EmbeddingConfig::default(),
+            embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
+            connectors: Vec::new(),
+        };
+
+        db.remember_skip_dedup(&make_entity(
+            "pool1-e",
+            "insight",
+            "pool1-key",
+            "{\"content\":\"embed me over a one-connection pool\"}",
+        ))
+        .expect("seed entity");
+
+        let started = std::time::Instant::now();
+        let res = db.embed_entity(&EmbedParams {
+            text: None,
+            category: Some("insight".to_string()),
+            key: Some("pool1-key".to_string()),
+            batch_category: None,
+            batch_limit: 100,
+        });
+        match res {
+            Ok(v) => assert_eq!(v["embedded"], 1, "single-mode embed should succeed: {v}"),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    !msg.contains("timed out") && !msg.contains("timeout"),
+                    "single-mode embed_entity nested a pool draw (checkout timed out \
+                     after {:?}): {msg}",
+                    started.elapsed()
+                );
+            }
+        }
+        // The pool must still be usable afterwards (nothing leaked a checkout).
+        assert!(db.health_check(), "pool wedged after single-mode embed");
+
+        let _ = fs::remove_file(&path_str);
     }
 
     #[test]
