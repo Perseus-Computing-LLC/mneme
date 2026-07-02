@@ -2,3 +2,4 @@
 workdir/
 __pycache__/
 .model-cache/
+.claude/

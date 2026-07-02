@@ -1647,6 +1647,13 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     let mut total_links = 0i64;
     let mut total_archived_cohere = 0i64;
 
+    // Snapshot the DB size BEFORE any mutation so db_size_delta_bytes is
+    // meaningful — it was previously read after all three steps had run, so
+    // the reported delta was always ≈0.
+    let initial_db_size = db
+        .file_size_bytes()
+        .map_err(|e| format!("Failed to get initial DB size: {}", e))?;
+
     // 1. Run mimir_cohere (promote, link, archive)
     let cohere_params = crate::models::CohereParams {
         dry_run: a.dry_run,
@@ -1665,14 +1672,13 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
         .decay_tick()
         .map_err(|e| format!("Autocohere step (decay) failed: {}", e))?;
 
-    // 3. Then mimir_compact (archive below threshold)
+    // 3. Then mimir_compact (archive below threshold). Use the same archive
+    // threshold as decay_tick/cohere so "run everything" forgets at the same
+    // point as the individual tools (was a hardcoded 0.1 → ~5 idle days sooner).
     let compact_report = db
-        .compact(0.1, a.dry_run)
+        .compact(Database::ARCHIVE_DECAY_THRESHOLD, a.dry_run)
         .map_err(|e| format!("Autocohere step (compact) failed: {}", e))?;
 
-    let initial_db_size = db
-        .file_size_bytes()
-        .map_err(|e| format!("Failed to get initial DB size: {}", e))?;
     let final_db_size = if a.dry_run {
         initial_db_size
     } else {
