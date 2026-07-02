@@ -3585,11 +3585,24 @@ impl Database {
 
     /// Update an entity's status (e.g., to "deprecated").
     ///
-    /// UNAUDITED (#375): writes no entity_history snapshot and does not
-    /// advance recorded_at — the status change is applied to the live row in
-    /// place. A caller pairing this with an audited change (e.g. supersede's
-    /// set_valid_to close) must apply the audited change FIRST, or the
-    /// snapshot will bake the new status into pre-change history.
+    /// AUDITED (#377, mirroring the #373 set_valid_to close): an ACTUAL
+    /// status change (stored != new) snapshots the pre-change row to
+    /// entity_history and advances the live row's transaction time, so
+    /// as_of/bitemporal_at at a tx instant before the change still
+    /// reconstruct the old status. This covers the expired-fact supersede
+    /// corner: when the fact's valid period is already closed, supersede's
+    /// set_valid_to is a no-op that writes no snapshot of its own, and this
+    /// flip's snapshot is the only thing keeping the pre-supersede status
+    /// reconstructable.
+    ///
+    /// A same-status call (e.g. re-superseding an already-deprecated fact)
+    /// refreshes archive_reason/last_accessed in place, unversioned by
+    /// design (#377 decision: a reason overwrite is operational metadata,
+    /// not a knowledge change).
+    ///
+    /// A nonexistent id is an error (the pre-#377 blind UPDATE silently
+    /// affected zero rows); the only in-product caller resolves the entity
+    /// first.
     pub fn update_entity_status(
         &self,
         id: &str,
@@ -3597,10 +3610,42 @@ impl Database {
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        conn.execute(
-            "UPDATE entities SET status = ?1, archive_reason = ?2, last_accessed_unix_ms = ?3 WHERE id = ?4",
-            params![status, reason, now_ms(), id],
+        let (cur_status, eff_from, old_rec): (Option<String>, i64, i64) = conn.query_row(
+            "SELECT status, \
+                    COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
+                    COALESCE(recorded_at_unix_ms, created_at_unix_ms) \
+             FROM entities WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        if cur_status.as_deref() == Some(status) {
+            conn.execute(
+                "UPDATE entities SET archive_reason = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+                params![reason, now_ms(), id],
+            )?;
+            return Ok(());
+        }
+        // Audited flip — same shape as set_valid_to's close (#373): snapshot
+        // the pre-change version (invalidated at `now`, bumped strictly past
+        // the old recorded_at so the history window is never zero-width),
+        // advance the live row's recorded_at and link supersedes, and pin a
+        // still-NULL valid_from to the old effective opening so advancing
+        // recorded_at can't silently shift the derived opening to `now`.
+        let now = now_ms().max(old_rec + 1);
+        let history_id = format!(
+            "hist-{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+        );
+        let tx = conn.unchecked_transaction()?;
+        Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
+        tx.execute(
+            "UPDATE entities SET status = ?1, archive_reason = ?2, last_accessed_unix_ms = ?3,
+                recorded_at_unix_ms = ?4, supersedes = ?5,
+                valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?6)
+             WHERE id = ?7",
+            params![status, reason, now_ms(), now, history_id, eff_from, id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3608,9 +3653,13 @@ impl Database {
     /// transaction time `invalidated_at` and linked back to the live id via
     /// `superseded_by`. All other columns (incl. the prior recorded_at) are
     /// copied verbatim, so the version was live during
-    /// [recorded_at, invalidated_at). Shared by the remember supersession /
-    /// audited-re-assert path (#371) and the audited set_valid_to close (#373);
-    /// the caller owns the transaction and the follow-up stamp of the live row.
+    /// [recorded_at, invalidated_at). status is coalesced to 'active': a
+    /// (product-unreachable, out-of-band) NULL status copied into the
+    /// immutable history would fail every subsequent history/as_of read of
+    /// the key. Shared by the remember supersession / audited-re-assert path
+    /// (#371), the audited set_valid_to close (#373), and the audited status
+    /// flip (#377); the caller owns the transaction and the follow-up stamp
+    /// of the live row.
     fn snapshot_live_row_to_history(
         conn: &rusqlite::Connection,
         history_id: &str,
@@ -3625,7 +3674,7 @@ impl Database {
               workspace_hash, agent_id, visibility, valid_from_unix_ms,
               valid_to_unix_ms, recorded_at_unix_ms, invalidated_at_unix_ms,
               supersedes, superseded_by, created_at_unix_ms, last_accessed_unix_ms)
-             SELECT ?1, id, category, key, body_json, status, type, tags,
+             SELECT ?1, id, category, key, body_json, COALESCE(status, 'active'), type, tags,
               decay_score, retrieval_count, layer, topic_path, archived,
               archive_reason, links, verified, source, always_on, certainty,
               workspace_hash, agent_id, visibility, valid_from_unix_ms,
