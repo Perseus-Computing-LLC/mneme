@@ -45,9 +45,14 @@ ort = { version = "2.0.0-rc.12", optional = true, features = ["download-binaries
 # defaults) so tokenizer behavior is otherwise unchanged. (#222)
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig", "progressbar"] }
 ndarray = { version = "0.17", optional = true }  # MUST match the ndarray version ort rc.12 depends on, else our arrays are a different crate-version type and TensorArrayData (from_array_view) won't accept them (#212)
+# prost/prost-types MUST stay on the same minor as tonic's own prost dep
+# (tonic 0.13 -> prost 0.13): tonic-build's generated code derives OUR prost's
+# `Message`, but tonic's codec requires ITS prost's `Message` — mixing 0.14
+# with tonic 0.13 fails every RPC with "trait bound `X: prost::message::Message`
+# is not satisfied". Caught by the grpc CI lane (#354).
 tonic = { version = "0.13", optional = true, features = ["transport"] }
-prost = { version = "0.14", optional = true }
-prost-types = { version = "0.14", optional = true }
+prost = { version = "0.13", optional = true }
+prost-types = { version = "0.13", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 
 # Optional: local multimodal document text extraction (#236). DOCX via `zip` +
@@ -64,7 +69,11 @@ pdf-extract = { version = "0.7", optional = true }
 # Build a lean binary without it via `cargo build --no-default-features`.
 default = ["bundled-embeddings"]
 bundled-embeddings = ["ort", "tokenizers", "ndarray"]
-grpc = ["tonic", "prost", "prost-types", "tonic-build"]
+# tokio-stream must be in this list: src/grpc.rs names it for the server
+# streaming types (WatchJournalStream/StreamContextStream). It was optional
+# but never wired to the feature, so the grpc build failed with
+# "unresolved module or unlinked crate `tokio_stream`" (#354).
+grpc = ["tonic", "prost", "prost-types", "tokio-stream", "tonic-build"]
 # Local document text extraction for mimir_ingest_file (DOCX/PDF). Opt-in.
 multimodal = ["zip", "pdf-extract"]
 
