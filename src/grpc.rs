@@ -12,7 +12,7 @@ pub mod grpc {
     tonic::include_proto!("mneme.v1");
 
     use std::sync::{Arc, Mutex};
-    use tonic::{Request, Response, Status, Streaming};
+    use tonic::{Request, Response, Status};
 
     use crate::db::Database;
     use crate::models;
@@ -62,8 +62,13 @@ pub mod grpc {
         async fn remember(&self, req: Request<RememberRequest>) -> Result<Response<RememberResponse>, Status> {
             let r = req.into_inner();
             with_db(self, |db| {
+                // Same id convention as the MCP surface (handle_remember):
+                // db.remember does NOT generate ids — an empty id here would be
+                // inserted verbatim, producing an entity unreachable by id.
+                let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
                 let entity = models::Entity {
-                    id: String::new(),
+                    id,
                     category: r.category,
                     key: r.key,
                     body_json: r.body_json,
@@ -86,6 +91,10 @@ pub mod grpc {
                     visibility: r.visibility,
                     created_at_unix_ms: crate::db::now_ms(),
                     last_accessed_unix_ms: crate::db::now_ms(),
+                    follow_count: 0,
+                    miss_count: 0,
+                    follow_rate: 0.0,
+                    efficacy_status: "unverified".to_string(),
                     embedding: None,
                 };
                 let (id, action) = db.remember(&entity)?;
@@ -111,22 +120,28 @@ pub mod grpc {
                     preview_cap: r.preview_cap,
                     always_on: r.always_on,
                     content_weight: r.content_weight,
+                    trust_weight: 0.0,
                     diversity_halving: r.diversity_halving,
                     diversity_per_query_share: 0.0,
+                    recency_half_life_secs: None,
                     workspace_hash: r.workspace_hash,
                     agent_id: r.agent_id,
                     visibility: r.visibility,
+                    layer: None,
+                    reinforce: false,
                 };
                 let entities = db.recall(&params)?;
-                let items = entities.into_iter().map(|e| entity_to_proto(&e)).collect();
-                Ok(Response::new(RecallResponse { items, total: items.len() as i64 }))
+                let items: Vec<EntityMessage> =
+                    entities.iter().map(entity_to_proto).collect();
+                let total = items.len() as i64;
+                Ok(Response::new(RecallResponse { items, total }))
             })
         }
 
         async fn get_entity(&self, req: Request<GetEntityRequest>) -> Result<Response<EntityMessage>, Status> {
             let r = req.into_inner();
             with_db(self, |db| {
-                let entity = db.get_entity_by_id(&r.id)
+                let entity = db.get_entity_by_id_public(&r.id)
                     .map_err(|_| Status::not_found("entity not found"))?
                     .ok_or_else(|| Status::not_found("entity not found"))?;
                 Ok(Response::new(entity_to_proto(&entity)))
@@ -181,7 +196,15 @@ pub mod grpc {
         async fn state_set(&self, req: Request<StateSetRequest>) -> Result<Response<StateSetResponse>, Status> {
             let r = req.into_inner();
             with_db(self, |db| {
-                db.state_set(&r.key, &r.value_json, r.ttl_seconds.map(|t| t as i64))?;
+                let now = crate::db::now_ms();
+                let entry = models::StateEntry {
+                    key: r.key,
+                    value_json: r.value_json,
+                    // Same TTL convention as the MCP surface (handle_state_set).
+                    expires_at_unix_ms: r.ttl_seconds.map(|ttl| now + (ttl as i64) * 1000),
+                    created_at_unix_ms: now,
+                };
+                db.state_set(&entry)?;
                 Ok(Response::new(StateSetResponse { ok: true }))
             })
         }
@@ -198,8 +221,7 @@ pub mod grpc {
         // ── Ops ──
         async fn health(&self, _req: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
             with_db(self, |db| {
-                db.health()?;
-                Ok(Response::new(HealthResponse { healthy: true }))
+                Ok(Response::new(HealthResponse { healthy: db.health_check() }))
             })
         }
         async fn stats(&self, _req: Request<StatsRequest>) -> Result<Response<StatsResponse>, Status> {
@@ -207,9 +229,9 @@ pub mod grpc {
                 let s = db.stats()?;
                 Ok(Response::new(StatsResponse {
                     total_entities: s.total_entities,
-                    total_journal: s.total_journal,
-                    total_state: s.total_state,
-                    db_size_bytes: s.db_size_bytes,
+                    total_journal: s.total_journal_events,
+                    total_state: s.total_state_entries,
+                    db_size_bytes: s.db_file_size_bytes as i64,
                 }))
             })
         }
@@ -378,6 +400,10 @@ pub mod grpc {
                 visibility: "workspace".to_string(),
                 created_at_unix_ms: 1,
                 last_accessed_unix_ms: 2,
+                follow_count: 0,
+                miss_count: 0,
+                follow_rate: 0.0,
+                efficacy_status: "unverified".to_string(),
                 embedding: None,
             };
             let p = entity_to_proto(&e);
