@@ -665,6 +665,13 @@ pub struct CorrectParams {
     pub category: String,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    /// Application-time period (#363): when the corrected fact was actually
+    /// true in the world. A correction that says "this was true last week"
+    /// sets valid_from in the past. None = transaction time / unbounded.
+    #[serde(default)]
+    pub valid_from_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub valid_to_unix_ms: Option<i64>,
 }
 
 /// Result from mimir_correct.

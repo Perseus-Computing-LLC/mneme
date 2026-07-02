@@ -302,6 +302,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "string",
           "default": "",
           "description": "Agent identity (v1.2.0). Tracks which agent wrote this entity. Used for agent attribution and context filtering."
+        },
+        "valid_from_unix_ms": {
+          "type": "integer",
+          "description": "Application-time period start (#363): when the fact became TRUE IN THE WORLD, independent of when it was recorded. Set in the past for retroactive facts ('this was true last week, we just learned it') without rewriting transaction history. Default: transaction time (now). Query with mimir_valid_at / mimir_bitemporal / recall's valid_at filter."
+        },
+        "valid_to_unix_ms": {
+          "type": "integer",
+          "description": "Application-time period end (#363, exclusive): when the fact STOPPED being true in the world. Omit for 'still true' (unbounded). Must be greater than valid_from_unix_ms."
         }
       },
       "required": [
@@ -455,6 +463,24 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "layer": {
             "type": "string",
             "description": "Filter by memory layer (world, episodic, semantic)."
+        },
+        "valid_at": {
+          "type": "integer",
+          "description": "Valid-time instant filter (#363, unix ms): only return facts whose application-time period [valid_from, valid_to) contains this world-instant — 'what was true at time T'. Applied after ranking, so it only narrows results."
+        },
+        "valid_from_unix_ms": {
+          "type": "integer",
+          "description": "Valid-time period filter start (#363, unix ms). Pair with valid_to_unix_ms and valid_op; ignored when valid_at is set. Omit for unbounded start."
+        },
+        "valid_to_unix_ms": {
+          "type": "integer",
+          "description": "Valid-time period filter end (#363, unix ms, exclusive). Omit for unbounded end."
+        },
+        "valid_op": {
+          "type": "string",
+          "default": "overlaps",
+          "enum": ["overlaps", "contains"],
+          "description": "SQL:2011 period predicate for the valid-time period filter (#363): 'overlaps' (fact's valid period shares at least one instant with the queried period) or 'contains' (fact's valid period contains the whole queried period)."
         }
       },
       "required": [
@@ -714,7 +740,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_as_of",
-    "description": "Bi-temporal time-travel: return the version of a fact (category + key) that Mneme believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. Returns found=false if the fact had not been recorded yet at that time.",
+    "description": "Transaction-time time-travel: return the version of a fact (category + key) that Mneme believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. For the orthogonal valid-time axis ('what was actually TRUE in the world at time T') use mimir_valid_at; for both axes at once use mimir_bitemporal. Returns found=false if the fact had not been recorded yet at that time.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -772,6 +798,168 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       "readOnlyHint": true
     },
     "title": "Time-Travel Entity Lookup"
+  },
+  {
+    "name": "mimir_valid_at",
+    "description": "Valid-time (application-time) lookup: return the version of a fact (category + key) that — per CURRENT knowledge — was actually true in the world at a given instant. Orthogonal to mimir_as_of: as_of answers 'what did we BELIEVE at time T' (transaction time); valid_at answers 'what WAS TRUE at time T, as we understand it now'. Facts carry a valid period [valid_from, valid_to) settable on mimir_remember; a later-recorded version's claim supersedes earlier claims for the instants it covers. Returns found=false if no version's valid period contains the instant.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key within the category"
+        },
+        "valid_at_unix_ms": {
+          "type": "integer",
+          "description": "World-instant (unix ms) to evaluate: which version was actually true then"
+        }
+      },
+      "required": [
+        "category",
+        "key",
+        "valid_at_unix_ms"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "False if no version's valid period contains the instant"
+        },
+        "id": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "body_json": {
+          "type": "string",
+          "description": "The fact's content as it was true at the instant"
+        },
+        "status": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string"
+        },
+        "valid_from_unix_ms": {
+          "type": "integer",
+          "description": "Start of the matched version's valid period"
+        },
+        "valid_to_unix_ms": {
+          "type": "integer",
+          "description": "End of the matched version's valid period (absent = still true)"
+        },
+        "recorded_at_unix_ms": {
+          "type": "integer",
+          "description": "Transaction time the matched version was recorded"
+        },
+        "is_live_version": {
+          "type": "boolean",
+          "description": "True when the matched version is the current live row (not superseded)"
+        },
+        "valid_at_unix_ms": {
+          "type": "integer"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Valid-Time Lookup (What Was True)"
+  },
+  {
+    "name": "mimir_bitemporal",
+    "description": "Full bi-temporal query (SQL:2011 SYSTEM_TIME + APPLICATION_TIME): 'as of transaction time tx_at, which version did we believe was true in the world at valid time valid_at?' Returns the exact cell of the bi-temporal rectangle — the audit-grade 'who knew what, as-of-when' question. Combines both axes: mimir_as_of is this with valid_at pinned to tx_at; mimir_valid_at is this with tx_at pinned to now. Retroactive and proactive updates land in the correct rectangle cell. Returns found=false if nothing recorded by tx_at was valid at valid_at.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key within the category"
+        },
+        "tx_at_unix_ms": {
+          "type": "integer",
+          "description": "Transaction-time instant (unix ms): reconstruct knowledge as of this moment"
+        },
+        "valid_at_unix_ms": {
+          "type": "integer",
+          "description": "Valid-time instant (unix ms): the world-moment being asked about"
+        }
+      },
+      "required": [
+        "category",
+        "key",
+        "tx_at_unix_ms",
+        "valid_at_unix_ms"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "False if nothing recorded by tx_at was valid at valid_at"
+        },
+        "id": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "body_json": {
+          "type": "string",
+          "description": "The version occupying that bi-temporal rectangle cell"
+        },
+        "status": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string"
+        },
+        "valid_from_unix_ms": {
+          "type": "integer"
+        },
+        "valid_to_unix_ms": {
+          "type": "integer"
+        },
+        "recorded_at_unix_ms": {
+          "type": "integer"
+        },
+        "invalidated_at_unix_ms": {
+          "type": "integer",
+          "description": "Transaction time this version was retired (absent = live)"
+        },
+        "is_live_version": {
+          "type": "boolean"
+        },
+        "tx_at_unix_ms": {
+          "type": "integer"
+        },
+        "valid_at_unix_ms": {
+          "type": "integer"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Bi-Temporal Rectangle Query"
   },
   {
     "name": "mimir_forget",
@@ -2659,6 +2847,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "string",
           "default": "workspace",
           "description": "Visibility: 'private', 'workspace', or 'public'"
+        },
+        "valid_from_unix_ms": {
+          "type": "integer",
+          "description": "Application-time period start (#363): when the corrected fact was actually true in the world. Set in the past for retroactive corrections. Default: transaction time."
+        },
+        "valid_to_unix_ms": {
+          "type": "integer",
+          "description": "Application-time period end (#363, exclusive). Omit for 'still true'."
         }
       },
       "required": [
@@ -2920,6 +3116,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "string",
           "description": "Link relationship type (default: 'supersedes')",
           "default": "supersedes"
+        },
+        "valid_to_unix_ms": {
+          "type": "integer",
+          "description": "When the OLD fact stopped being true in the world (#363, unix ms). Defaults to transaction time (now). Closes the old entity's application-time period so mimir_valid_at stops returning it from that instant on."
         }
       },
       "required": [
@@ -2941,6 +3141,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "from_entity_key": {
           "type": "string"
+        },
+        "from_valid_to_unix_ms": {
+          "type": "integer",
+          "description": "The instant the old fact's validity was closed at (#363)"
         },
         "to_entity_id": {
           "type": "string",
@@ -3269,6 +3473,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_get_entity" => tools::handle_get_entity(db, args).map_err(|e| e.to_string()),
         "mimir_history" => tools::handle_history(db, args).map_err(|e| e.to_string()),
         "mimir_as_of" => tools::handle_as_of(db, args).map_err(|e| e.to_string()),
+        "mimir_valid_at" => tools::handle_valid_at(db, args).map_err(|e| e.to_string()),
+        "mimir_bitemporal" => tools::handle_bitemporal(db, args).map_err(|e| e.to_string()),
         "mimir_forget" => tools::handle_forget(db, args).map_err(|e| e.to_string()),
 
         "mimir_ingest" => tools::handle_ingest(db, args).map_err(|e| e.to_string()),
@@ -3503,6 +3709,71 @@ mod tests {
 
         drop(db);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn bitemporal_tools_are_registered_and_dispatch_under_all_aliases() {
+        // #363: mimir_valid_at / mimir_bitemporal exist in the registry (with
+        // mneme_/perseus_vault_ aliases synthesized like every other tool) and
+        // dispatch through call_tool under each prefix.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-bitemporal-tools-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        let listed = list_tools(Some(json!(1)));
+        let tools = listed.result.expect("tools/list result")["tools"].clone();
+        let names: Vec<String> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for expect in [
+            "mimir_valid_at",
+            "mneme_valid_at",
+            "perseus_vault_valid_at",
+            "mimir_bitemporal",
+            "mneme_bitemporal",
+            "perseus_vault_bitemporal",
+        ] {
+            assert!(names.contains(&expect.to_string()), "missing tool {expect}");
+        }
+
+        // Round-trip through call_tool under every prefix.
+        let stored = call_tool(
+            "mimir_remember",
+            &db,
+            json!({"category": "f", "key": "k", "body_json": "{\"note\":\"x\"}",
+                   "valid_from_unix_ms": 1000}),
+            None,
+        );
+        assert!(stored.contains("created"), "{stored}");
+        for prefix in ["mimir", "mneme", "perseus_vault"] {
+            let r = call_tool(
+                &format!("{prefix}_valid_at"),
+                &db,
+                json!({"category": "f", "key": "k", "valid_at_unix_ms": 2000}),
+                None,
+            );
+            assert!(r.contains("\"found\":true"), "{prefix}_valid_at: {r}");
+            let b = call_tool(
+                &format!("{prefix}_bitemporal"),
+                &db,
+                json!({"category": "f", "key": "k",
+                       "tx_at_unix_ms": now_ms_for_test(), "valid_at_unix_ms": 2000}),
+                None,
+            );
+            assert!(b.contains("\"found\":true"), "{prefix}_bitemporal: {b}");
+        }
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn now_ms_for_test() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
 
     #[test]

@@ -30,6 +30,20 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   insights (`evidence_for` to every source, `derivation: "dream"`, idempotent
   by evidence-set hash, contradiction-aware, bounded budgets, dry-run;
   verified/importance-floored sources never archived). 53rd MCP tool (#364)
+- **Bi-temporal memory — queryable valid-time axis (#363,
+  SQL:2011 APPLICATION_TIME).** The `valid_from`/`valid_to` columns are no
+  longer write-only: facts now carry a queryable application-time period
+  ("when was this true in the world"), orthogonal to the existing
+  transaction-time axis (`mimir_as_of`). New tools `mimir_valid_at`
+  (what was actually true at instant T, per current knowledge) and
+  `mimir_bitemporal` (the full 2-axis rectangle query: "as of transaction
+  time T, what did we believe was true at valid time V"). Valid time is
+  settable on `mimir_remember`/`mimir_correct` (`valid_from_unix_ms` /
+  `valid_to_unix_ms`, defaulting to transaction time / unbounded);
+  `mimir_supersede` closes the old fact's valid period. `mimir_recall` gains
+  `valid_at` and SQL:2011 `overlaps`/`contains` period filters. Schema v9
+  backfills `valid_from = recorded_at` on existing rows (idempotent). Tool
+  count 53 → 55.
 
 ### Fixed
 - Context injection relevance gating (#356): `context`/`prepare` no longer

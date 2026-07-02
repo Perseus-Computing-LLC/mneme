@@ -150,7 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -344,6 +344,22 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          );
          CREATE INDEX IF NOT EXISTS idx_communities_ws ON communities(workspace_hash);",
     )?;
+
+    // ── v9 (#363): bi-temporal valid-time backfill ──────────────────────
+    // Self-contained block (renumber-safe). The valid-time axis becomes
+    // queryable (mimir_valid_at / mimir_bitemporal / recall valid filters),
+    // so make the historical convention "NULL valid_from = valid since the
+    // fact was recorded" explicit: backfill valid_from to the row's
+    // transaction time. valid_to stays NULL (= still true / unbounded).
+    // Idempotent and re-runnable — only NULL rows are touched, and query
+    // paths still COALESCE for rows written by older binaries afterwards.
+    conn.execute_batch(
+        "UPDATE entities SET valid_from_unix_ms = COALESCE(recorded_at_unix_ms, created_at_unix_ms) \
+         WHERE valid_from_unix_ms IS NULL; \
+         UPDATE entity_history SET valid_from_unix_ms = COALESCE(recorded_at_unix_ms, created_at_unix_ms) \
+         WHERE valid_from_unix_ms IS NULL;",
+    )?;
+    // ── end v9 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -974,13 +990,67 @@ mod tests {
             .query_row("SELECT invalidated_at_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(invalidated, None, "existing rows must be live (not invalidated)");
+        // v7 (#363): the historical "NULL = valid since recorded" convention is
+        // made explicit — valid_from backfills to the transaction time.
         let valid_from: Option<i64> = conn
             .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(valid_from, None, "existing rows must be valid since creation");
+        assert_eq!(valid_from, Some(111), "v7 must backfill valid_from to recorded_at");
+        let valid_to: Option<i64> = conn
+            .query_row("SELECT valid_to_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(valid_to, None, "valid_to must stay NULL (= still true)");
 
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v7_valid_from_backfill_is_idempotent_and_preserves_explicit_values() {
+        // A v6-era DB: bi-temporal columns exist, valid_from is NULL on one row
+        // and explicitly set on another. The v7 backfill must fill only the
+        // NULL row, leave the explicit one alone, and be safely re-runnable.
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("fresh init");
+        conn.execute_batch(
+            "INSERT INTO entities (id, category, key, body_json, recorded_at_unix_ms,
+                                   valid_from_unix_ms, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('v7-null', 'note', 'a', '{}', 500, NULL, 400, 400),
+                    ('v7-set',  'note', 'b', '{}', 500, 42,   400, 400);
+             INSERT INTO entity_history (history_id, id, category, key, body_json,
+                                         recorded_at_unix_ms, valid_from_unix_ms,
+                                         created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('h1', 'v7-null', 'note', 'a', '{}', 300, NULL, 300, 300);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        initialize_schema(&conn).expect("v6 -> v7 migration");
+
+        let vf_null: Option<i64> = conn
+            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-null'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vf_null, Some(500), "NULL valid_from must backfill to recorded_at");
+        let vf_set: Option<i64> = conn
+            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-set'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vf_set, Some(42), "explicit valid_from must be preserved");
+        let vf_hist: Option<i64> = conn
+            .query_row("SELECT valid_from_unix_ms FROM entity_history WHERE history_id='h1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vf_hist, Some(300), "history rows must backfill too");
+
+        // Re-run (rewind the stamp): idempotent, values unchanged.
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        initialize_schema(&conn).expect("v7 re-run");
+        let vf_again: Option<i64> = conn
+            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-null'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vf_again, Some(500));
+        let vf_set_again: Option<i64> = conn
+            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-set'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vf_set_again, Some(42));
     }
 
     #[test]

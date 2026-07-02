@@ -1592,7 +1592,7 @@ impl Database {
         &self,
         entity: &Entity,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, false)
+        self.remember_impl(entity, false, None, None)
     }
 
     /// Like `remember`, but never merges the write into a near-duplicate.
@@ -1603,13 +1603,31 @@ impl Database {
         &self,
         entity: &Entity,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, true)
+        self.remember_impl(entity, true, None, None)
+    }
+
+    /// `remember` with an explicit application-time (valid-time) period (#363,
+    /// SQL:2011 APPLICATION_TIME). `valid_from`/`valid_to` say when the fact
+    /// is/was TRUE IN THE WORLD, independent of when it was recorded — a
+    /// retroactive correction ("this was true last week, we just learned it")
+    /// sets `valid_from` in the past without rewriting transaction history.
+    /// `None` defaults to transaction time for `valid_from` and unbounded
+    /// ("still true") for `valid_to`, matching plain `remember`.
+    pub fn remember_with_validity(
+        &self,
+        entity: &Entity,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl(entity, false, valid_from, valid_to)
     }
 
     fn remember_impl(
         &self,
         entity: &Entity,
         skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let tags_json = serde_json::to_string(&entity.tags)?;
@@ -1756,6 +1774,8 @@ impl Database {
                     archived = ?8, archive_reason = ?9, links = ?10,
                     verified = ?11, source = ?12, last_accessed_unix_ms = ?13,
                     always_on = ?14, certainty = ?15, workspace_hash = ?16, agent_id = ?17, visibility = ?18,
+                    valid_from_unix_ms = COALESCE(?20, valid_from_unix_ms),
+                    valid_to_unix_ms = COALESCE(?21, valid_to_unix_ms),
                     retrieval_count = retrieval_count + 1
                  WHERE id = ?19",
                 params![
@@ -1778,16 +1798,27 @@ impl Database {
                     entity.agent_id,
                     entity.visibility,
                     id,
+                    // Valid-time overrides (#363): only override when the caller
+                    // supplied them; an identical re-assertion without explicit
+                    // validity keeps the stored period untouched. On a content
+                    // change the stamp UPDATE below re-sets them unconditionally.
+                    valid_from,
+                    valid_to,
                 ],
             )?;
 
             // Stamp the now-current version's transaction time and link it back to
             // the snapshot it replaced. Only on a real content change, so an
             // identical re-assertion leaves recorded_at/supersedes untouched.
+            // The new version's valid-time period defaults to [now, ∞) when the
+            // caller didn't say otherwise (#363): new content is a new claim
+            // about the world starting at transaction time — inheriting the old
+            // version's valid_from would silently backdate it.
             if content_changed {
                 tx.execute(
-                    "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2 WHERE id = ?3",
-                    params![now, history_id, id],
+                    "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
+                        valid_from_unix_ms = ?4, valid_to_unix_ms = ?5 WHERE id = ?3",
+                    params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
                 )?;
             }
 
@@ -1851,11 +1882,12 @@ impl Database {
                   decay_score, retrieval_count, layer, topic_path,
                   archived, archive_reason, links, verified, source,
                   always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
-                  workspace_hash, agent_id, visibility, recorded_at_unix_ms)
+                  workspace_hash, agent_id, visibility, recorded_at_unix_ms,
+                  valid_from_unix_ms, valid_to_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
-                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 params![
                     id,
                     entity.category,
@@ -1882,6 +1914,10 @@ impl Database {
                     entity.visibility,
                     // Transaction time: a new fact's recorded_at is its creation time.
                     entity.created_at_unix_ms,
+                    // Application time (#363): defaults to [creation, ∞) — i.e.
+                    // "true in the world from when we recorded it, still true".
+                    valid_from.unwrap_or(entity.created_at_unix_ms),
+                    valid_to,
                 ],
             )?;
 
@@ -2858,6 +2894,154 @@ impl Database {
         }
     }
 
+    /// Fetch every version (live + superseded) of (category, key) that had been
+    /// recorded by `tx_at`, newest transaction time first, with its temporal
+    /// columns. Shared plumbing for the valid-time axis (#363).
+    fn versions_recorded_by(
+        &self,
+        category: &str,
+        key: &str,
+        tx_at: i64,
+    ) -> Result<Vec<TemporalVersion>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let enc = self.encryption.as_ref();
+        // Inner column order matches entity_from_row (NULL embedding at 18,
+        // efficacy constants at 24-27 like as_of); temporal columns appended
+        // AFTER index 27 so entity_from_row's index mapping is untouched.
+        const TCOLS: &str = "id, category, key, body_json, status, type, tags, decay_score, \
+             retrieval_count, layer, topic_path, archived, archive_reason, links, verified, \
+             source, created_at_unix_ms, last_accessed_unix_ms, NULL as embedding, always_on, \
+             certainty, workspace_hash, agent_id, visibility, \
+             0 as follow_count, 0 as miss_count, 0.0 as follow_rate, 'unverified' as efficacy_status, \
+             valid_from_unix_ms, valid_to_unix_ms, \
+             COALESCE(recorded_at_unix_ms, created_at_unix_ms) as rec, \
+             invalidated_at_unix_ms";
+        let sql = format!(
+            "SELECT * FROM (
+                SELECT {TCOLS} FROM entities WHERE category = ?1 AND key = ?2
+                UNION ALL
+                SELECT {TCOLS} FROM entity_history WHERE category = ?1 AND key = ?2
+             ) WHERE rec <= ?3
+             ORDER BY rec DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![category, key, tx_at], |r| {
+            let entity = entity_from_row(r, enc)?;
+            Ok(TemporalVersion {
+                entity,
+                valid_from_unix_ms: r.get::<_, Option<i64>>(28)?,
+                valid_to_unix_ms: r.get::<_, Option<i64>>(29)?,
+                recorded_at_unix_ms: r.get::<_, i64>(30)?,
+                invalidated_at_unix_ms: r.get::<_, Option<i64>>(31)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// The full 2-axis bi-temporal query (#363, SQL:2011 SYSTEM_TIME +
+    /// APPLICATION_TIME): "as of transaction time `tx_at`, which version did we
+    /// believe was true in the world at valid time `valid_at`?" Returns the
+    /// exact cell of the bi-temporal rectangle, or None.
+    ///
+    /// Semantics: among versions recorded by `tx_at`, the LATEST-recorded one
+    /// whose valid period contains `valid_at` wins ("newest knowledge about
+    /// that world-instant"). A version's effective valid period is half-open
+    /// [valid_from, valid_to) with two defaults resolved at query time:
+    ///   * valid_from NULL (pre-v7 rows) falls back to its transaction time,
+    ///   * an open valid_to is implicitly closed by the earliest valid_from
+    ///     among LATER-recorded versions visible at `tx_at` — recording a new
+    ///     claim "true since V" retires the previous claim from V onward, per
+    ///     the classic Snodgrass update semantics, without mutating history.
+    /// This keeps retroactive segments answerable (the old version still
+    /// answers for instants before the new version's valid_from) and keeps
+    /// the reconstruction honest for past `tx_at` (at that time, nothing had
+    /// closed the old version yet).
+    pub fn bitemporal_at(
+        &self,
+        category: &str,
+        key: &str,
+        tx_at: i64,
+        valid_at: i64,
+    ) -> Result<Option<TemporalVersion>, Box<dyn std::error::Error>> {
+        let versions = self.versions_recorded_by(category, key, tx_at)?;
+        // Walk newest-recorded first, tracking the earliest effective
+        // valid_from among versions already seen (i.e. recorded later): that is
+        // the implicit close for every older version's open period.
+        let mut min_later_from: Option<i64> = None;
+        for v in versions {
+            let eff_from = v.valid_from_unix_ms.unwrap_or(v.recorded_at_unix_ms);
+            let eff_to = match (v.valid_to_unix_ms, min_later_from) {
+                (Some(t), Some(m)) => Some(t.min(m)),
+                (Some(t), None) => Some(t),
+                (None, m) => m,
+            };
+            if eff_from <= valid_at && eff_to.map_or(true, |t| valid_at < t) {
+                return Ok(Some(v));
+            }
+            min_later_from =
+                Some(min_later_from.map_or(eff_from, |m: i64| m.min(eff_from)));
+        }
+        Ok(None)
+    }
+
+    /// The valid-time axis alone (#363): the version of (category, key) that is
+    /// believed — per CURRENT knowledge — to have been true in the world at
+    /// `valid_at`. Orthogonal to `as_of` (transaction time): `as_of` answers
+    /// "what did we believe at T"; this answers "what was actually true at T,
+    /// as we understand it now". Equivalent to `bitemporal_at` with tx_at = ∞.
+    pub fn valid_at(
+        &self,
+        category: &str,
+        key: &str,
+        valid_at: i64,
+    ) -> Result<Option<TemporalVersion>, Box<dyn std::error::Error>> {
+        self.bitemporal_at(category, key, i64::MAX, valid_at)
+    }
+
+    /// Effective valid periods for a set of live entities, keyed by id (#363).
+    /// Used by recall's valid-time filters. Returns (valid_from, valid_to)
+    /// with valid_from already COALESCEd to the row's transaction time, and
+    /// valid_to None = unbounded (still true).
+    pub fn valid_periods_for_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (i64, Option<i64>)>, Box<dyn std::error::Error>>
+    {
+        let mut map = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(map);
+        }
+        let conn = self.conn()?;
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
+                    valid_to_unix_ms \
+             FROM entities WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (id, from, to) = r?;
+            map.insert(id, (from, to));
+        }
+        Ok(map)
+    }
+
     /// Query journal events with time-range and filter parameters.
     pub fn timeline(
         &self,
@@ -3290,6 +3474,19 @@ impl Database {
         conn.execute(
             "UPDATE entities SET status = ?1, archive_reason = ?2, last_accessed_unix_ms = ?3 WHERE id = ?4",
             params![status, reason, now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Close an entity's application-time period (#363): record when the fact
+    /// stopped being true in the world. Used by mimir_supersede — superseding
+    /// a fact ends its validity (at transaction time unless the caller says
+    /// when). Does not touch the transaction axis.
+    pub fn set_valid_to(&self, id: &str, valid_to: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE entities SET valid_to_unix_ms = ?1 WHERE id = ?2",
+            params![valid_to, id],
         )?;
         Ok(())
     }
@@ -5928,8 +6125,10 @@ last_accessed: {}
             created_at_unix_ms: now,
             last_accessed_unix_ms: now,
         };
-        self.remember(&entity)?;
-        
+        // #363: corrections often describe when the corrected fact was actually
+        // true in the world — pass the caller's valid-time period through.
+        self.remember_with_validity(&entity, params.valid_from_unix_ms, params.valid_to_unix_ms)?;
+
         // Also create a journal entry
         let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
         let event = crate::models::JournalEvent {
@@ -6629,6 +6828,64 @@ pub(crate) fn sanitize_prompt_field(s: &str) -> String {
 }
 
 /// Extract an Entity from a SQLite row, decrypting body_json if encryption is enabled.
+/// One version of a fact with its bi-temporal coordinates (#363): the entity
+/// content plus its application-time (valid_from/valid_to) and transaction-time
+/// (recorded_at/invalidated_at) periods. Returned by `valid_at`/`bitemporal_at`
+/// so callers can report both axes without widening `Entity` itself.
+#[derive(Debug, Clone)]
+pub struct TemporalVersion {
+    pub entity: crate::models::Entity,
+    /// When the fact became true in the world (NULL on pre-v7 rows = since recorded).
+    pub valid_from_unix_ms: Option<i64>,
+    /// When it stopped being true (None = still true / unbounded).
+    pub valid_to_unix_ms: Option<i64>,
+    /// Transaction time: when this version was recorded (COALESCEd to created_at).
+    pub recorded_at_unix_ms: i64,
+    /// Transaction time: when this version was retired (None = the live version).
+    pub invalidated_at_unix_ms: Option<i64>,
+}
+
+/// SQL:2011-style period predicates over half-open periods [from, to), with
+/// `None` end = unbounded (#363). `row` is the stored fact's effective valid
+/// period; `query` is the caller's period. Pure so the semantics are unit
+/// testable without a database.
+///
+///   * "overlaps": the periods share at least one instant —
+///     row_from < query_to AND query_from < row_to.
+///   * "contains": the row period contains the whole query period —
+///     row_from <= query_from AND query_to <= row_to.
+/// An instant T is queried as the degenerate period [T, T]: containment of a
+/// point (row_from <= T < row_to) — pass `query = (T, Some(T))` with
+/// "contains_point" handled by callers via `valid_period_contains_instant`.
+pub fn valid_period_matches(
+    row_from: i64,
+    row_to: Option<i64>,
+    query_from: i64,
+    query_to: Option<i64>,
+    op: &str,
+) -> bool {
+    match op {
+        "contains" => {
+            row_from <= query_from
+                && match (query_to, row_to) {
+                    (Some(qt), Some(rt)) => qt <= rt,
+                    (_, None) => true,         // row unbounded: contains any end
+                    (None, Some(_)) => false,  // unbounded query, bounded row
+                }
+        }
+        // Default: OVERLAPS. Unbounded ends always satisfy their side.
+        _ => {
+            row_to.map_or(true, |rt| query_from < rt)
+                && query_to.map_or(true, |qt| row_from < qt)
+        }
+    }
+}
+
+/// Does the stored valid period [from, to) contain the instant `t`? (#363)
+pub fn valid_period_contains_instant(row_from: i64, row_to: Option<i64>, t: i64) -> bool {
+    row_from <= t && row_to.map_or(true, |rt| t < rt)
+}
+
 fn entity_from_row(
     row: &rusqlite::Row,
     encryption: Option<&EncryptionManager>,
@@ -7277,6 +7534,339 @@ mod tests {
             .expect("v1 must be reachable at its own recorded_at instant");
         assert!(mid.body_json.contains("Bonn"));
 
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── Bi-temporal valid-time axis (#363) ─────────────────────────
+
+    /// Read the live row's stored valid period straight from SQL.
+    fn stored_valid_period(db: &Database, id: &str) -> (Option<i64>, Option<i64>) {
+        db.conn()
+            .unwrap()
+            .query_row(
+                "SELECT valid_from_unix_ms, valid_to_unix_ms FROM entities WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn valid_time_defaults_to_transaction_time_and_roundtrips() {
+        // A caller that never sets valid time gets the documented default:
+        // valid_from = creation (transaction time), valid_to = unbounded.
+        let (db, path) = temp_db();
+        let v = make_entity("e-vt-def", "facts", "roe", r#"{"note":"weapons hold"}"#);
+        db.remember(&v).unwrap();
+
+        let (vf, vt) = stored_valid_period(&db, "e-vt-def");
+        assert_eq!(vf, Some(v.created_at_unix_ms), "valid_from defaults to creation");
+        assert_eq!(vt, None, "valid_to defaults to unbounded (still true)");
+
+        // valid_at contains [valid_from, ∞): found from creation on…
+        let hit = db
+            .valid_at("facts", "roe", v.created_at_unix_ms)
+            .unwrap()
+            .expect("valid at its own valid_from instant");
+        assert!(hit.entity.body_json.contains("weapons hold"));
+        assert!(hit.invalidated_at_unix_ms.is_none(), "live version");
+        // …and found=false strictly before.
+        assert!(
+            db.valid_at("facts", "roe", v.created_at_unix_ms - 1)
+                .unwrap()
+                .is_none(),
+            "not valid before valid_from"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retroactive_valid_from_roundtrips_and_leaves_transaction_axis_untouched() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        // v1 recorded now.
+        let v1 = make_entity("e-vt-r", "facts", "posture", r#"{"note":"defcon 4"}"#);
+        db.remember(&v1).unwrap();
+        let r1 = v1.created_at_unix_ms;
+
+        sleep(Duration::from_millis(5));
+        let t_mid = now_ms();
+        sleep(Duration::from_millis(5));
+
+        // v2 recorded later, but retroactively true since a week before r1:
+        // "we just learned this was already the case".
+        let vf2 = r1 - 7 * 24 * 3600 * 1000;
+        let v2 = make_entity("ignored", "facts", "posture", r#"{"note":"defcon 3"}"#);
+        db.remember_with_validity(&v2, Some(vf2), None).unwrap();
+
+        // Valid-time axis: v2 answers for every instant >= vf2 (newest
+        // knowledge wins even inside v1's old window)…
+        for t in [vf2, r1, t_mid, now_ms() + 60_000] {
+            let hit = db.valid_at("facts", "posture", t).unwrap().expect("v2 covers t");
+            assert!(
+                hit.entity.body_json.contains("defcon 3"),
+                "retroactive v2 must answer for t={t}"
+            );
+        }
+        // …and found=false before the retroactive start.
+        assert!(db.valid_at("facts", "posture", vf2 - 1).unwrap().is_none());
+
+        // Transaction axis is INDEPENDENT and untouched: as_of still replays
+        // what was believed, not what was retroactively true.
+        assert!(db.as_of("facts", "posture", r1 - 1).unwrap().is_none());
+        let believed_mid = db.as_of("facts", "posture", t_mid).unwrap().expect("v1 believed at mid");
+        assert!(
+            believed_mid.body_json.contains("defcon 4"),
+            "as_of(mid) must still return v1 despite v2's retroactive valid_from"
+        );
+        let believed_now = db
+            .as_of("facts", "posture", now_ms() + 60_000)
+            .unwrap()
+            .expect("v2 believed now");
+        assert!(believed_now.body_json.contains("defcon 3"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bitemporal_rectangle_all_four_quadrants() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        // The classic Snodgrass setup: v1 recorded at r1 (valid since r1);
+        // v2 recorded at r2 with a retroactive valid_from strictly between.
+        let v1 = make_entity("e-bt-q", "facts", "border", r#"{"note":"open"}"#);
+        db.remember(&v1).unwrap();
+        let r1 = v1.created_at_unix_ms;
+
+        sleep(Duration::from_millis(5));
+        let t_seg = now_ms(); // instant inside v1's preserved segment
+        sleep(Duration::from_millis(5));
+        let vf2 = now_ms(); // v2's retroactive world-start
+        sleep(Duration::from_millis(5));
+        let tx_before_v2 = now_ms(); // transaction instant before v2 is recorded
+        sleep(Duration::from_millis(5));
+
+        let v2 = make_entity("ignored", "facts", "border", r#"{"note":"closed"}"#);
+        db.remember_with_validity(&v2, Some(vf2), None).unwrap();
+        let r2: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT recorded_at_unix_ms FROM entities WHERE category='facts' AND key='border'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(r2 > tx_before_v2, "v2 must be recorded after tx_before_v2");
+        let tx_now = r2 + 60_000;
+
+        // Quadrant 1 — old knowledge, old world-instant: at tx_before_v2 we
+        // believed v1, and v1's claim covered vf2 (nothing had shadowed it yet).
+        let q1 = db
+            .bitemporal_at("facts", "border", tx_before_v2, vf2)
+            .unwrap()
+            .expect("q1: v1 was believed true then");
+        assert!(q1.entity.body_json.contains("open"), "q1 = v1");
+
+        // Quadrant 2 — old knowledge, pre-existence instant: found=false.
+        assert!(
+            db.bitemporal_at("facts", "border", tx_before_v2, r1 - 1)
+                .unwrap()
+                .is_none(),
+            "q2: nothing was believed true before v1's valid_from"
+        );
+
+        // Quadrant 3 — new knowledge, instant inside the retroactive window:
+        // v2's claim (true since vf2) supersedes v1's for t >= vf2.
+        let q3 = db
+            .bitemporal_at("facts", "border", tx_now, vf2)
+            .unwrap()
+            .expect("q3: v2 retroactively covers vf2");
+        assert!(q3.entity.body_json.contains("closed"), "q3 = v2");
+
+        // Quadrant 4 — new knowledge, instant in v1's PRESERVED segment
+        // [r1, vf2): the retroactive update didn't erase v1's earlier claim.
+        let q4 = db
+            .bitemporal_at("facts", "border", tx_now, t_seg)
+            .unwrap()
+            .expect("q4: v1 still answers for its preserved segment");
+        assert!(q4.entity.body_json.contains("open"), "q4 = v1");
+
+        // Consistency: the two single-axis tools are the rectangle's edges.
+        let via_valid = db.valid_at("facts", "border", t_seg).unwrap().unwrap();
+        assert_eq!(via_valid.entity.body_json, q4.entity.body_json);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn proactive_valid_from_takes_effect_only_at_its_start() {
+        // Proactive (post-dated) update: recorded now, true starting next week.
+        let (db, path) = temp_db();
+        let v1 = make_entity("e-bt-p", "facts", "policy", r#"{"note":"old policy"}"#);
+        db.remember(&v1).unwrap();
+
+        let future = now_ms() + 7 * 24 * 3600 * 1000;
+        let v2 = make_entity("ignored", "facts", "policy", r#"{"note":"new policy"}"#);
+        db.remember_with_validity(&v2, Some(future), None).unwrap();
+
+        // Today the OLD fact is still what's true in the world…
+        let today = db.valid_at("facts", "policy", now_ms()).unwrap().expect("v1 today");
+        assert!(today.entity.body_json.contains("old policy"));
+        // …and after the start instant the NEW one takes over.
+        let later = db.valid_at("facts", "policy", future).unwrap().expect("v2 later");
+        assert!(later.entity.body_json.contains("new policy"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn explicit_valid_to_ends_a_fact_without_leaking_older_versions() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        // v1 open-ended, then v2 with a BOUNDED valid period. For instants
+        // after v2's valid_to, neither version may answer: v2 ended, and v1
+        // is shadowed from v2's valid_from onward (its claim was superseded).
+        let v1 = make_entity("e-bt-e", "facts", "ceasefire", r#"{"note":"none"}"#);
+        db.remember(&v1).unwrap();
+        sleep(Duration::from_millis(5));
+
+        let vf2 = now_ms();
+        let vt2 = vf2 + 10_000;
+        let v2 = make_entity("ignored", "facts", "ceasefire", r#"{"note":"72h ceasefire"}"#);
+        db.remember_with_validity(&v2, Some(vf2), Some(vt2)).unwrap();
+
+        // Inside [vf2, vt2): v2.
+        let during = db.valid_at("facts", "ceasefire", vf2 + 5_000).unwrap().expect("v2 during");
+        assert!(during.entity.body_json.contains("72h"));
+        // valid_to is exclusive: at vt2 the fact has ended…
+        assert!(
+            db.valid_at("facts", "ceasefire", vt2).unwrap().is_none(),
+            "at valid_to the fact must have ended (half-open period)"
+        );
+        // …and v1 must NOT resurface after it (shadowed from vf2 onward).
+        assert!(
+            db.valid_at("facts", "ceasefire", vt2 + 60_000).unwrap().is_none(),
+            "an ended fact must not leak the older superseded version"
+        );
+        // v1 still answers for its preserved pre-vf2 segment.
+        let before = db
+            .valid_at("facts", "ceasefire", vf2 - 1)
+            .unwrap()
+            .expect("v1 before v2's window");
+        assert!(before.entity.body_json.contains("none"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn content_update_without_validity_resets_period_to_transaction_time() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        // v1 with an explicit retroactive valid_from…
+        let v1 = make_entity("e-bt-u", "facts", "loc", r#"{"note":"alpha"}"#);
+        let retro = v1.created_at_unix_ms - 60_000;
+        db.remember_with_validity(&v1, Some(retro), None).unwrap();
+        assert_eq!(stored_valid_period(&db, "e-bt-u").0, Some(retro));
+
+        sleep(Duration::from_millis(5));
+        // …then a plain content update with NO validity: the new version's
+        // period must default to its own transaction time, not silently
+        // inherit the old retroactive start.
+        let v2 = make_entity("ignored", "facts", "loc", r#"{"note":"bravo"}"#);
+        db.remember(&v2).unwrap();
+        let (vf, vt) = stored_valid_period(&db, "e-bt-u");
+        let r2: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT recorded_at_unix_ms FROM entities WHERE id='e-bt-u'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vf, Some(r2), "new version's valid_from defaults to its transaction time");
+        assert_eq!(vt, None);
+
+        // An identical re-assertion WITH validity updates the period in place
+        // (no new version) — e.g. annotating when the unchanged fact began.
+        let v3 = make_entity("ignored", "facts", "loc", r#"{"note":"bravo"}"#);
+        db.remember_with_validity(&v3, Some(retro), None).unwrap();
+        assert_eq!(
+            stored_valid_period(&db, "e-bt-u").0,
+            Some(retro),
+            "identical re-assert with explicit validity overrides the stored period"
+        );
+        let hist_count: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE category='facts' AND key='loc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hist_count, 1, "the identical re-assert must not snapshot a new version");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn valid_period_predicates_follow_sql2011_semantics() {
+        use super::{valid_period_contains_instant, valid_period_matches};
+        // Instant containment over half-open [from, to).
+        assert!(valid_period_contains_instant(100, Some(200), 100), "from is inclusive");
+        assert!(valid_period_contains_instant(100, Some(200), 199));
+        assert!(!valid_period_contains_instant(100, Some(200), 200), "to is exclusive");
+        assert!(!valid_period_contains_instant(100, Some(200), 99));
+        assert!(valid_period_contains_instant(100, None, i64::MAX), "open end = still true");
+
+        // OVERLAPS: share at least one instant.
+        assert!(valid_period_matches(100, Some(200), 150, Some(250), "overlaps"));
+        assert!(valid_period_matches(100, Some(200), 50, Some(101), "overlaps"));
+        assert!(!valid_period_matches(100, Some(200), 200, Some(300), "overlaps"), "adjacent periods do not overlap");
+        assert!(!valid_period_matches(100, Some(200), 250, Some(300), "overlaps"));
+        assert!(valid_period_matches(100, None, 250, Some(300), "overlaps"), "open row end overlaps any later period");
+        assert!(valid_period_matches(100, Some(200), 50, None, "overlaps"), "open query end");
+
+        // CONTAINS: the row period contains the whole query period.
+        assert!(valid_period_matches(100, Some(200), 120, Some(180), "contains"));
+        assert!(valid_period_matches(100, Some(200), 100, Some(200), "contains"), "a period contains itself");
+        assert!(!valid_period_matches(100, Some(200), 90, Some(180), "contains"));
+        assert!(!valid_period_matches(100, Some(200), 120, Some(210), "contains"));
+        assert!(valid_period_matches(100, None, 120, None, "contains"), "unbounded row contains unbounded query");
+        assert!(!valid_period_matches(100, Some(200), 120, None, "contains"), "bounded row cannot contain an unbounded query");
+    }
+
+    #[test]
+    fn valid_periods_for_ids_coalesces_legacy_null_valid_from() {
+        // A pre-v7-style row (valid_from NULL) written by an older binary must
+        // still get a usable effective period via COALESCE.
+        let (db, path) = temp_db();
+        let v = make_entity("e-vt-legacy", "facts", "old-row", r#"{"note":"x"}"#);
+        db.remember(&v).unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET valid_from_unix_ms = NULL WHERE id = 'e-vt-legacy'",
+                [],
+            )
+            .unwrap();
+        let map = db.valid_periods_for_ids(&["e-vt-legacy".to_string()]).unwrap();
+        let &(from, to) = map.get("e-vt-legacy").expect("period present");
+        assert_eq!(from, v.created_at_unix_ms, "NULL valid_from falls back to transaction time");
+        assert_eq!(to, None);
+        // And valid_at agrees.
+        assert!(db.valid_at("facts", "old-row", v.created_at_unix_ms).unwrap().is_some());
+        assert!(db.valid_at("facts", "old-row", v.created_at_unix_ms - 1).unwrap().is_none());
         let _ = fs::remove_file(&path);
     }
 
