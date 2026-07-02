@@ -1,3 +1,4 @@
+mod communities;
 mod connectors;
 mod db;
 mod embedding;

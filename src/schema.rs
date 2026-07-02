@@ -150,7 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -319,6 +319,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_category_key_ws \
          ON entities(category, key, workspace_hash); \
          DROP INDEX IF EXISTS idx_entities_category_key;",
+    )?;
+
+    // ── v8 (#365): GraphRAG communities ─────────────────────────────────
+    // Self-contained block (easy to renumber at merge). Persists the output
+    // of community detection over the entity link graph: one row per detected
+    // community, scoped to a workspace. `id` is derived from a digest of the
+    // sorted member ids, so a membership change produces a NEW community id —
+    // that is the cache-invalidation mechanism for community summaries (the
+    // state-digest cache-key pattern from #256). All DDL is IF NOT EXISTS,
+    // so this block is idempotent and safe to re-run.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS communities (
+            id TEXT PRIMARY KEY,                        -- 'com-' + digest of sorted member ids
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            member_ids TEXT NOT NULL DEFAULT '[]',      -- JSON array of entity ids
+            member_digest TEXT NOT NULL DEFAULT '',     -- digest of the member set (cache key)
+            summary TEXT NOT NULL DEFAULT '',           -- extractive (or LLM-polished) summary
+            summary_entity_id TEXT NOT NULL DEFAULT '', -- entities.id of the stored summary entity
+            algorithm TEXT NOT NULL DEFAULT 'label_prop',
+            modularity REAL NOT NULL DEFAULT 0.0,       -- partition modularity of the detection run
+            member_count INTEGER NOT NULL DEFAULT 0,
+            generated_at_unix_ms INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_communities_ws ON communities(workspace_hash);",
     )?;
 
     // Stamp the migration level so subsequent opens skip the probe block above.
@@ -555,6 +579,21 @@ pub fn gather_stats(conn: &Connection, db_path: &str) -> Result<Stats, Box<dyn s
         })
         .ok();
 
+    // Graph health (#365): community membership + modularity, so operators
+    // can see whether the link graph has global structure. Defaults keep the
+    // stats call working even if the communities table is somehow absent.
+    let total_communities: i64 = conn
+        .query_row("SELECT COUNT(*) FROM communities", [], |r| r.get(0))
+        .unwrap_or(0);
+    let graph_modularity: Option<f64> = conn
+        .query_row(
+            "SELECT modularity FROM communities \
+             ORDER BY generated_at_unix_ms DESC, id ASC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
     Ok(Stats {
         total_entities,
         by_category,
@@ -565,6 +604,8 @@ pub fn gather_stats(conn: &Connection, db_path: &str) -> Result<Stats, Box<dyn s
         db_file_size_bytes: db_size,
         oldest_unix_ms: oldest,
         newest_unix_ms: newest,
+        total_communities,
+        graph_modularity,
     })
 }
 
@@ -990,6 +1031,66 @@ mod tests {
             !joined.to_uppercase().contains("TEMP B-TREE"),
             "recall query should not need a temp-b-tree sort, got: {joined}"
         );
+    }
+
+    #[test]
+    fn fresh_db_has_communities_table() {
+        // v8 (#365): GraphRAG communities table + workspace index.
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("init schema");
+        assert!(
+            conn.prepare("SELECT id, workspace_hash, member_ids, member_digest, summary, \
+                          summary_entity_id, algorithm, modularity, member_count, \
+                          generated_at_unix_ms FROM communities LIMIT 1")
+                .is_ok(),
+            "communities table with all v8 columns must exist on a fresh DB"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_communities_ws'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_communities_ws must be created");
+    }
+
+    #[test]
+    fn migrates_legacy_db_to_v8_with_communities_table() {
+        // A v6-era DB (fully migrated through emb_sig, user_version=6) must
+        // gain the communities table when re-opened, and land on the current
+        // SCHEMA_VERSION, without disturbing existing data.
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("fresh init");
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('v8-keep', 'note', 'k', '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Rewind to the v6 state: communities table gone, version 6.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_communities_ws;
+             DROP TABLE IF EXISTS communities;
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT id FROM communities LIMIT 1").is_err(),
+            "precondition: v6 DB lacks the communities table"
+        );
+
+        initialize_schema(&conn).expect("v6 -> v8 migration");
+
+        assert!(conn.prepare("SELECT id FROM communities LIMIT 1").is_ok());
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities WHERE id='v8-keep'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "migration must not drop data");
     }
 
     #[test]

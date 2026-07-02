@@ -268,7 +268,7 @@ impl Database {
     /// Check out a pooled connection. Each DB method binds one of these and uses
     /// it for the duration of the call (so a method's statements — including any
     /// transaction — share a single connection). (#210)
-    fn conn(&self) -> Result<PooledConn, Box<dyn std::error::Error>> {
+    pub(crate) fn conn(&self) -> Result<PooledConn, Box<dyn std::error::Error>> {
         Ok(self.pool.get()?)
     }
 
@@ -5950,6 +5950,85 @@ impl Database {
         }
         Ok(out)
     }
+
+    /// Hydrate non-archived entities by id, preserving the order of `ids`.
+    /// Missing/archived ids are silently skipped. Same chunked IN(...) batch
+    /// pattern as `graph_expand` (#340) so a large community never turns into
+    /// an N+1 point-query loop. Used by the GraphRAG community paths (#365).
+    pub(crate) fn entities_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<crate::models::Entity>, Box<dyn std::error::Error>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let enc = self.encryption.as_ref();
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, category, key, body_json, status, type, tags,
+                        decay_score, retrieval_count, layer, topic_path,
+                        archived, archive_reason, links, verified, source,
+                        created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                        always_on, certainty, workspace_hash, agent_id, visibility,
+                        follow_count, miss_count, follow_rate, efficacy_status
+                 FROM entities WHERE archived = 0 AND id IN ({})",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows =
+                stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
+            let mut by_id: std::collections::HashMap<String, crate::models::Entity> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let e = row?;
+                by_id.insert(e.id.clone(), e);
+            }
+            for id in chunk {
+                if let Some(e) = by_id.remove(id) {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Minimal completion call against the configured LLM endpoint (Ollama
+    /// /api/generate wire shape, same as `ask`/`synthesize`). Used by the
+    /// optional community-summary polish path (#365) — callers must degrade
+    /// to the extractive path when this errors or when the LLM is disabled.
+    pub(crate) fn llm_generate(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if !self.llm_config.enabled {
+            return Err("LLM is not enabled. Set --llm-endpoint to enable it.".into());
+        }
+        let body = serde_json::json!({
+            "model": self.llm_config.model,
+            "prompt": prompt,
+            "stream": false,
+        });
+        let body_str = serde_json::to_string(&body)?;
+        let mut request = ureq::post(&self.llm_config.endpoint)
+            .set("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(self.llm_config.timeout_secs));
+        if let Some(ref key) = self.llm_config.api_key {
+            request = request.set("Authorization", &format!("Bearer {}", key));
+        }
+        let response_body = request
+            .send_string(&body_str)
+            .map_err(|e| format!("LLM API call failed: {}", e))?
+            .into_string()?;
+        let json: serde_json::Value = serde_json::from_str(&response_body)?;
+        Ok(json["response"].as_str().unwrap_or_default().to_string())
+    }
 }
 
 /// Common English function/question words stripped from the hybrid keyword arm
@@ -5961,7 +6040,7 @@ impl Database {
 /// is dropped). This list intentionally covers only high-frequency English
 /// stopwords and interrogatives; it is used solely for the hybrid sparse arm and
 /// never alters what the `fts5` keyword mode matches.
-fn is_stopword(word: &str) -> bool {
+pub(crate) fn is_stopword(word: &str) -> bool {
     const STOPWORDS: &[&str] = &[
         "a", "an", "and", "any", "are", "as", "at", "be", "been", "by", "can", "could", "did",
         "do", "does", "each", "for", "from", "had", "has", "have", "he", "her", "his", "how", "i",

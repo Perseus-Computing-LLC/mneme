@@ -14,6 +14,16 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   for "opus"-class hosts. Legacy dump is opt-in via `mode: "always_inject"`.
 - Always-on set hard-capped (5 entities) under recall-first, with a
   documented overflow warning steering toward `recall_when` triggers (#366).
+- GraphRAG over the link graph (#365): `mimir_communities` (deterministic
+  community detection — label propagation with neighborhood-overlap weighting,
+  or greedy one-level modularity "louvain"; pure Rust, no new dependencies),
+  `mimir_community_summary` (extractive by default, optional LLM polish,
+  materialized as a `community_summary` entity with `evidence_for` links,
+  cached by member-set digest), and `mimir_global_recall` (breadth over
+  community summaries, then depth into the best communities' members — cites
+  entities across clusters instead of only the nearest one). Communities are
+  persisted in a new `communities` table (schema v8); `mimir_stats` now
+  reports `total_communities` and `graph_modularity`.
 
 ### Fixed
 - Context injection relevance gating (#356): `context`/`prepare` no longer

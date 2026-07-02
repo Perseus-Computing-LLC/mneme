@@ -528,6 +528,11 @@ pub struct Stats {
     pub db_file_size_bytes: u64,
     pub oldest_unix_ms: Option<i64>,
     pub newest_unix_ms: Option<i64>,
+    /// Detected link-graph communities currently persisted (#365 GraphRAG).
+    pub total_communities: i64,
+    /// Partition modularity of the most recent community-detection run
+    /// (None until `mimir_communities` has run at least once).
+    pub graph_modularity: Option<f64>,
 }
 
 /// Graph node for entity link visualization.
