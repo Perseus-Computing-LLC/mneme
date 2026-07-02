@@ -1730,7 +1730,11 @@ impl Database {
             // so an explicit re-open to NULL is not even expressible on this
             // path) writes NO spurious snapshot. Acceptance is unchanged: the
             // inversion guards below still apply.
-            let audit_period_change = if !content_changed
+            //
+            // Some(old effective valid_from) when the change must be audited —
+            // carried to the stamp UPDATE below so the effective opening can
+            // be pinned before recorded_at moves; None otherwise.
+            let audit_reassert_from: Option<i64> = if !content_changed
                 && (valid_from.is_some() || valid_to.is_some())
             {
                 let (stored_eff_from, stored_to): (i64, Option<i64>) = conn.query_row(
@@ -1742,10 +1746,16 @@ impl Database {
                 )?;
                 let new_eff_from = valid_from.unwrap_or(stored_eff_from);
                 let new_to = valid_to.or(stored_to);
-                stored_to.is_some() && (new_eff_from != stored_eff_from || new_to != stored_to)
+                if stored_to.is_some() && (new_eff_from != stored_eff_from || new_to != stored_to)
+                {
+                    Some(stored_eff_from)
+                } else {
+                    None
+                }
             } else {
-                false
+                None
             };
+            let audit_period_change = audit_reassert_from.is_some();
             // Guarantee this version's recorded_at is strictly after the
             // superseded version's own recorded_at, so as_of() sees a real,
             // non-zero-width interval. now_ms() has 1ms resolution; two
@@ -1910,17 +1920,25 @@ impl Database {
                         valid_from_unix_ms = ?4, valid_to_unix_ms = ?5 WHERE id = ?3",
                     params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
                 )?;
-            } else if audit_period_change {
+            } else if let Some(old_eff_from) = audit_reassert_from {
                 // #371: the audited re-assert is a new version of knowledge
                 // recorded at `now` — advance recorded_at and link back to the
                 // snapshot so as_of's contiguous partition holds (history row
                 // live during [old recorded_at, now), live row from [now, ∞)).
                 // The valid bounds were already applied by the COALESCE UPDATE
                 // above (caller's values where supplied, stored otherwise), so
-                // unlike the content-change stamp they are not re-set here.
+                // unlike the content-change stamp they are not re-set here —
+                // EXCEPT to pin a still-NULL valid_from (pre-v9 rows a legacy
+                // binary may still write; schema.rs keeps them queryable) to
+                // the OLD effective opening. Readers derive effective
+                // valid_from via COALESCE(valid_from, recorded_at, …), so
+                // advancing recorded_at over a NULL valid_from would silently
+                // jump the opening to `now` and could invert the live period
+                // against a caller valid_to that the guards accepted.
                 tx.execute(
-                    "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2 WHERE id = ?3",
-                    params![now, history_id, id],
+                    "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
+                        valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?4) WHERE id = ?3",
+                    params![now, history_id, id, old_eff_from],
                 )?;
             }
 
