@@ -3443,8 +3443,15 @@ mod tests {
         let closed_at = v["from_valid_to_unix_ms"].as_i64().expect("close instant");
 
         // Two snapshots of the OLD fact (the audited close, then the audited
-        // status flip — #377); the successor untouched.
-        assert_eq!(db.history_versions("facts", "anachron").unwrap().len(), 2);
+        // status flip — #377); the successor untouched. Both snapshots are
+        // pre-flip versions, so NEITHER may carry the deprecation — that
+        // baked-in status is exactly the #375/#377 bug.
+        let hist = db.history_versions("facts", "anachron").unwrap();
+        assert_eq!(hist.len(), 2);
+        assert!(
+            hist.iter().all(|v| v.status == "active"),
+            "no history snapshot may bake in the later deprecation"
+        );
         assert!(db.history_versions("facts", "anachron-new").unwrap().is_empty());
 
         // Pre-supersede reconstruction: ACTIVE and open.
@@ -3494,7 +3501,9 @@ mod tests {
         use std::time::Duration;
         let (db, path) = temp_db();
 
-        let expiry = now_ms() + 20;
+        // Generous margin: the remembers below must land before `expiry`, or
+        // the insert path rejects the inverted period under CI load.
+        let expiry = now_ms() + 200;
         handle_remember(
             &db,
             json!({"category": "facts", "key": "expired-old",
@@ -3510,8 +3519,9 @@ mod tests {
         .expect("successor");
 
         // Let the fact expire naturally; its status is still 'active'.
-        sleep(Duration::from_millis(30));
-        assert!(now_ms() > expiry, "fact must be past its valid_to");
+        while now_ms() <= expiry {
+            sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             db.get_entity("facts", "expired-old").unwrap().unwrap().status,
             "active"
@@ -3533,12 +3543,15 @@ mod tests {
         .expect("supersede expired fact");
 
         // The close was a no-op (the period had already ended), so the flip's
-        // snapshot is the ONLY history row.
+        // snapshot is the ONLY history row — and it captures the pre-flip
+        // status.
+        let hist = db.history_versions("facts", "expired-old").unwrap();
         assert_eq!(
-            db.history_versions("facts", "expired-old").unwrap().len(),
+            hist.len(),
             1,
             "the audited status flip must snapshot when the close no-ops"
         );
+        assert_eq!(hist[0].status, "active");
 
         // Pre-supersede reconstruction at an in-period instant: ACTIVE, with
         // the original expiry intact.

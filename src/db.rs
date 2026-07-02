@@ -3599,6 +3599,10 @@ impl Database {
     /// refreshes archive_reason/last_accessed in place, unversioned by
     /// design (#377 decision: a reason overwrite is operational metadata,
     /// not a knowledge change).
+    ///
+    /// A nonexistent id is an error (the pre-#377 blind UPDATE silently
+    /// affected zero rows); the only in-product caller resolves the entity
+    /// first.
     pub fn update_entity_status(
         &self,
         id: &str,
@@ -3649,10 +3653,13 @@ impl Database {
     /// transaction time `invalidated_at` and linked back to the live id via
     /// `superseded_by`. All other columns (incl. the prior recorded_at) are
     /// copied verbatim, so the version was live during
-    /// [recorded_at, invalidated_at). Shared by the remember supersession /
-    /// audited-re-assert path (#371), the audited set_valid_to close (#373),
-    /// and the audited status flip (#377); the caller owns the transaction
-    /// and the follow-up stamp of the live row.
+    /// [recorded_at, invalidated_at). status is coalesced to 'active': a
+    /// (product-unreachable, out-of-band) NULL status copied into the
+    /// immutable history would fail every subsequent history/as_of read of
+    /// the key. Shared by the remember supersession / audited-re-assert path
+    /// (#371), the audited set_valid_to close (#373), and the audited status
+    /// flip (#377); the caller owns the transaction and the follow-up stamp
+    /// of the live row.
     fn snapshot_live_row_to_history(
         conn: &rusqlite::Connection,
         history_id: &str,
@@ -3667,7 +3674,7 @@ impl Database {
               workspace_hash, agent_id, visibility, valid_from_unix_ms,
               valid_to_unix_ms, recorded_at_unix_ms, invalidated_at_unix_ms,
               supersedes, superseded_by, created_at_unix_ms, last_accessed_unix_ms)
-             SELECT ?1, id, category, key, body_json, status, type, tags,
+             SELECT ?1, id, category, key, body_json, COALESCE(status, 'active'), type, tags,
               decay_score, retrieval_count, layer, topic_path, archived,
               archive_reason, links, verified, source, always_on, certainty,
               workspace_hash, agent_id, visibility, valid_from_unix_ms,
