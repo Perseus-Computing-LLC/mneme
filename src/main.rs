@@ -424,6 +424,18 @@ enum Commands {
         /// Emit raw JSON instead of the <memory-prep> markdown block
         #[arg(long)]
         json: bool,
+        /// Explicit character budget for the context portion (#366). Overrides
+        /// the model profile. Default: 1500 (recall-first default profile).
+        #[arg(long)]
+        max_context_chars: Option<i64>,
+        /// Host model name for budget-profile resolution (#366) — e.g. an
+        /// "opus" model gets a larger budget. Unknown models use the default.
+        #[arg(long)]
+        model: Option<String>,
+        /// Opt back into the legacy unconditional top-N context dump instead
+        /// of the recall-first, relevance-gated default (#356/#366).
+        #[arg(long)]
+        legacy_context: bool,
     },
 }
 
@@ -848,12 +860,16 @@ fn truncate_for_prepare(s: &str, max_len: usize) -> String {
 /// PMB-inspired `perseus-vault prepare` — pre-turn auto-injection ("Prepare").
 /// Runs the two read-only, zero-LLM-call queries that together approximate
 /// "what should be in context before this turn starts": `recall_when`
-/// (proactive trigger match against the task description) and `context`
-/// (top always-on + recent entities). Prints a single `<memory-prep>` block
-/// so a Hermes pre-turn hook can splice the result straight into the system
-/// prompt, instead of relying on the agent remembering to call
-/// `mimir_recall_when` itself mid-conversation. Cost: two local SQLite
-/// queries, no network, no model calls — designed to run on every turn.
+/// (proactive trigger match against the task description) and a recall-first
+/// context block (#356/#366: capped always-on set + entities relevant to the
+/// task, clamped to a per-model character budget — NOT the legacy
+/// unconditional top-N dump, which is opt-in via --legacy-context). Prints a
+/// single `<memory-prep>` block so a Hermes pre-turn hook can splice the
+/// result straight into the system prompt, instead of relying on the agent
+/// remembering to call `mimir_recall_when` itself mid-conversation. Cost:
+/// local SQLite queries only, no network, no model calls — designed to run
+/// on every turn.
+#[allow(clippy::too_many_arguments)]
 fn run_prepare(
     db: &db::Database,
     task: &str,
@@ -861,6 +877,9 @@ fn run_prepare(
     context_limit: i64,
     workspace: Option<&str>,
     json_output: bool,
+    max_context_chars: Option<i64>,
+    model: Option<&str>,
+    legacy_context: bool,
 ) {
     let recall_when_hits = if task.trim().is_empty() {
         Vec::new()
@@ -874,11 +893,39 @@ fn run_prepare(
         }
     };
 
-    let context_md = match db.context(&[], context_limit, workspace) {
-        Ok(md) => md,
+    let opts = crate::models::ContextOptions {
+        categories: Vec::new(),
+        limit: context_limit,
+        workspace_hash: workspace.map(str::to_string),
+        // The task is the relevance gate — context injects only what matches
+        // it (plus the capped always-on set). recall_when hits get their own
+        // section above, so exclude them from the context body.
+        query: if task.trim().is_empty() {
+            None
+        } else {
+            Some(task.to_string())
+        },
+        mode: if legacy_context {
+            crate::models::ContextMode::AlwaysInject
+        } else {
+            crate::models::ContextMode::OnDemand
+        },
+        max_context_chars,
+        model: model.map(str::to_string),
+        exclude_ids: recall_when_hits.iter().map(|e| e.id.clone()).collect(),
+    };
+
+    let context_block = match db.context_block(&opts) {
+        Ok(block) => block,
         Err(e) => {
             eprintln!("mimir: prepare: context failed: {}", e);
-            String::new()
+            crate::models::ContextBlock {
+                markdown: String::new(),
+                mode: opts.mode.as_str().to_string(),
+                budget_chars: 0,
+                entities_injected: 0,
+                warnings: Vec::new(),
+            }
         }
     };
 
@@ -887,13 +934,17 @@ fn run_prepare(
             "task": task,
             "recall_when": recall_when_hits.iter().map(|e| e.to_json_expanded()).collect::<Vec<_>>(),
             "recall_when_count": recall_when_hits.len(),
-            "context_markdown": context_md,
+            "context_markdown": context_block.markdown,
+            "context_mode": context_block.mode,
+            "context_budget_chars": context_block.budget_chars,
+            "context_entities_injected": context_block.entities_injected,
+            "context_warnings": context_block.warnings,
         });
         println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
         return;
     }
 
-    println!("{}", render_prepare_block(&recall_when_hits, &context_md));
+    println!("{}", render_prepare_block(&recall_when_hits, &context_block.markdown));
 }
 
 /// Pure rendering step for `perseus-vault prepare`'s non-JSON output — split
@@ -1094,6 +1145,9 @@ fn main() {
             context_limit,
             ref workspace,
             json,
+            max_context_chars,
+            ref model,
+            legacy_context,
         }) => {
             let database = open_db_or_exit(db_path);
             run_prepare(
@@ -1103,6 +1157,9 @@ fn main() {
                 context_limit,
                 workspace.as_deref(),
                 json,
+                max_context_chars,
+                model.as_deref(),
+                legacy_context,
             );
         }
         Some(Commands::StateDigest { db: ref db_path }) => {
@@ -1855,6 +1912,9 @@ mod tests {
                 context_limit,
                 workspace,
                 json,
+                max_context_chars,
+                model,
+                legacy_context,
             }) => {
                 assert_eq!(db, "/tmp/prep.db");
                 assert_eq!(task, "deploying the service");
@@ -1862,6 +1922,39 @@ mod tests {
                 assert_eq!(context_limit, 3);
                 assert_eq!(workspace, None);
                 assert!(!json);
+                // #366 recall-first defaults: no explicit budget/model
+                // override, and the legacy dump is NOT the default.
+                assert_eq!(max_context_chars, None);
+                assert_eq!(model, None);
+                assert!(!legacy_context);
+            }
+            _ => panic!("expected prepare subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_prepare_budget_and_legacy_flags() {
+        let cli = Cli::parse_from([
+            "mimir",
+            "prepare",
+            "--task",
+            "review auth flow",
+            "--max-context-chars",
+            "800",
+            "--model",
+            "claude-opus-4-8",
+            "--legacy-context",
+        ]);
+        match cli.command {
+            Some(Commands::Prepare {
+                max_context_chars,
+                model,
+                legacy_context,
+                ..
+            }) => {
+                assert_eq!(max_context_chars, Some(800));
+                assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+                assert!(legacy_context);
             }
             _ => panic!("expected prepare subcommand"),
         }

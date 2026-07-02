@@ -353,12 +353,27 @@ pub struct MigrateArgs {
 
 #[derive(Debug, Deserialize)]
 pub struct ContextArgs {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub categories: Vec<String>,
     #[serde(default = "default_context_limit")]
     pub limit: i64,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    /// Current task/message text — the relevance gate for recall-first
+    /// injection (#356). Without it, on_demand mode injects no topical
+    /// entities (compact pointer + capped always-on set only).
+    #[serde(default)]
+    pub query: Option<String>,
+    /// "on_demand" (default, recall-first) or "always_inject" (legacy
+    /// unconditional dump, opt-in) (#366).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Host model name for budget-profile resolution (#366).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Explicit character budget; overrides the model profile (#366).
+    #[serde(default)]
+    pub max_context_chars: Option<i64>,
 }
 
 fn default_context_limit() -> i64 {
@@ -1089,10 +1104,43 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         Err(e) => return json!({"error": format!("Invalid context arguments: {}", e)}).to_string(),
     };
 
-    match db.context(&a.categories, a.limit, a.workspace_hash.as_deref()) {
-        Ok(markdown) => {
-            let total_chars = markdown.len();
-            json!({"markdown": markdown, "total_chars": total_chars}).to_string()
+    // #366: recall-first is the default posture; the legacy unconditional
+    // dump is an explicit opt-in.
+    let mode = match a.mode.as_deref().unwrap_or("on_demand") {
+        "" | "on_demand" => crate::models::ContextMode::OnDemand,
+        "always_inject" | "legacy" => crate::models::ContextMode::AlwaysInject,
+        other => {
+            return json!({"error": format!(
+                "Invalid context mode '{}': expected 'on_demand' (default) or 'always_inject'",
+                other
+            )})
+            .to_string()
+        }
+    };
+
+    let opts = crate::models::ContextOptions {
+        categories: a.categories,
+        limit: a.limit,
+        workspace_hash: a.workspace_hash,
+        query: a.query,
+        mode,
+        max_context_chars: a.max_context_chars,
+        model: a.model,
+        exclude_ids: Vec::new(),
+    };
+
+    match db.context_block(&opts) {
+        Ok(block) => {
+            let total_chars = block.markdown.len();
+            json!({
+                "markdown": block.markdown,
+                "total_chars": total_chars,
+                "mode": block.mode,
+                "budget_chars": block.budget_chars,
+                "entities_injected": block.entities_injected,
+                "warnings": block.warnings,
+            })
+            .to_string()
         }
         Err(e) => json!({"error": format!("Context generation failed: {}", e)}).to_string(),
     }
@@ -2392,6 +2440,64 @@ mod tests {
         let v = json!({ "query": "test", "limit": null });
         let a: RecallArgs = serde_json::from_value(v).unwrap();
         assert_eq!(a.limit, 10);
+    }
+
+    #[test]
+    fn context_args_accept_null_for_new_optional_fields() {
+        // #356/#366 args must follow the same explicit-null tolerance rule
+        // as the rest of the tool surface (#330).
+        for field in ["query", "mode", "model", "max_context_chars", "workspace_hash", "categories"] {
+            let mut v = json!({});
+            v.as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), Value::Null);
+            let result: Result<ContextArgs, _> = serde_json::from_value(v);
+            assert!(
+                result.is_ok(),
+                "field `{}` with explicit null should deserialize, got {:?}",
+                field,
+                result.err()
+            );
+        }
+    }
+
+    fn temp_tool_db() -> (Database, String) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mimir-tools-test-{}.db", uuid::Uuid::new_v4()));
+        let path_str = path.to_str().unwrap().to_string();
+        let db = Database::open(&path_str).expect("open test db");
+        (db, path_str)
+    }
+
+    #[test]
+    fn handle_context_defaults_to_recall_first_on_demand() {
+        let (db, path) = temp_tool_db();
+        let out = handle_context(&db, json!({}));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mode"], "on_demand", "recall-first must be the default: {out}");
+        assert_eq!(v["budget_chars"], 1500);
+        assert!(
+            v["markdown"].as_str().unwrap().contains("Recall-first mode"),
+            "no-query default output must be the retrieval pointer: {out}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_context_rejects_unknown_mode() {
+        let (db, path) = temp_tool_db();
+        let out = handle_context(&db, json!({"mode": "firehose"}));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("Invalid context mode"),
+            "unknown mode must be rejected: {out}"
+        );
+        // The legacy opt-in spelling still parses.
+        let legacy = handle_context(&db, json!({"mode": "always_inject"}));
+        let lv: Value = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(lv["mode"], "always_inject");
+        assert_eq!(lv["budget_chars"], 0);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

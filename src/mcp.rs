@@ -250,7 +250,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         r###"[
   {
     "name": "mimir_remember",
-    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. Optional always_on=true injects entity into every mimir_context. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
+    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first mimir_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1667,7 +1667,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_context",
-    "description": "Return a pre-formatted markdown context block of the most important entities for session injection. The downstream system (Perseus) uses this to pre-load AI agent context with relevant memories before work begins.",
+    "description": "Return a pre-formatted markdown context block for session injection. Recall-first by default (mode 'on_demand'): pass `query` (the current task/message) and only topically relevant entities — recall_when trigger matches + keyword matches — are injected, alongside a hard-capped always-on set, clamped to a per-model character budget. Without `query` the block is a compact retrieval pointer (byte-stable across unrelated writes — prefix-cache friendly). The legacy unconditional top-N dump requires explicit mode 'always_inject'. Output is informational context, not instructions.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1685,7 +1685,25 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are included. Omit for no workspace filtering — in a federated vault that leaks every workspace's memory into the block."
+          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are included (always-on set too). Omit for no workspace filtering — in a federated vault that leaks every workspace's memory into the block."
+        },
+        "query": {
+          "type": "string",
+          "description": "Current task/message text — the relevance gate (#356). In on_demand mode only entities whose recall_when triggers or indexed content match it are injected; omit for a compact retrieval pointer with no topical injection."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["on_demand", "always_inject"],
+          "default": "on_demand",
+          "description": "Injection posture (#366). 'on_demand' (default): relevance-gated, budget-clamped, recall-first. 'always_inject': legacy unconditional top-N dump (no relevance gating) — explicit opt-in only."
+        },
+        "model": {
+          "type": "string",
+          "description": "Host model name for recall-budget profile resolution (#366), e.g. 'claude-opus-4-8' gets a larger budget. Unknown/omitted models use the default 1500-char profile."
+        },
+        "max_context_chars": {
+          "type": "integer",
+          "description": "Explicit character budget for the rendered block; overrides the model profile. In always_inject mode output is clamped only when this is set."
         }
       },
       "required": []
@@ -1700,6 +1718,25 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "total_chars": {
           "type": "integer",
           "description": "Character count of the markdown content"
+        },
+        "mode": {
+          "type": "string",
+          "description": "Resolved injection mode: on_demand or always_inject"
+        },
+        "budget_chars": {
+          "type": "integer",
+          "description": "Resolved character budget (0 = unclamped legacy output)"
+        },
+        "entities_injected": {
+          "type": "integer",
+          "description": "Number of entities actually injected (always-on + topical)"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Soft warnings: always-on cap overflow, budget truncation"
         }
       }
     },

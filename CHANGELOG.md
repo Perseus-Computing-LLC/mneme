@@ -5,7 +5,23 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Added
+- Recall-first context injection (#366): `mimir_context` / `prepare` default
+  to `mode: on_demand` — a relevance-gated, budget-clamped block instead of
+  the unconditional top-N dump. New `mimir_context` params: `query`, `mode`,
+  `model`, `max_context_chars`; new `prepare` flags: `--max-context-chars`,
+  `--model`, `--legacy-context`. Per-model budgets: 1500 chars default, 6000
+  for "opus"-class hosts. Legacy dump is opt-in via `mode: "always_inject"`.
+- Always-on set hard-capped (5 entities) under recall-first, with a
+  documented overflow warning steering toward `recall_when` triggers (#366).
+
 ### Fixed
+- Context injection relevance gating (#356): `context`/`prepare` no longer
+  dump topically unrelated entities — injection is gated by `recall_when`
+  trigger matching + stopword-filtered keyword search against the current
+  query (retrieval_count is no longer a relevance proxy), workspace-scoped
+  including the always-on set. Injected blocks are framed as informational
+  memory, not authoritative instructions.
 - MCP Registry publish: `server.json` version/OCI identifier now synced from
   `Cargo.toml` at publish time, and the publish waits for the GHCR image tag
   to exist, so a stale hand-maintained version can never be published again

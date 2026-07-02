@@ -65,7 +65,7 @@ This is deliberate: before v2.12.x, `autocohere` compacted at a hardcoded 0.1
 | Mechanism | Effect |
 |---|---|
 | `verified: true` | `decay_score` floored at `VERIFIED_DECAY_FLOOR = 0.2` — a verified fact can fade but is **never auto-archived**. |
-| `always_on: true` | Injected unconditionally into `context`/`prepare` blocks regardless of decay; being injected does not itself bump retrieval stats. |
+| `always_on: true` | Injected into `context`/`prepare` blocks regardless of decay; being injected does not itself bump retrieval stats. Under the recall-first default (see below) the always-on set is hard-capped at 5 entities and counts against the context budget — overflow truncates and warns. Reserve it for identity-critical facts; prefer `recall_when` triggers. |
 | `mimir_score` (importance) | The explicit score is stored as a persistent `importance` floor: `decay_tick` and `cohere` never recompute `decay_score` below it, so a scored memory survives idle time indefinitely (fidelity beats recency). Re-score with `0.0` to clear. |
 | regular use | Every recall boosts the score by 0.25 and resets the idle clock. |
 
@@ -123,6 +123,32 @@ it into background forgetting:
 category per run, cold-first, archiving sources), skipping the `observation`
 category (no meta-observations) and `memories` (files from the /memories
 adapter are never similarity-merged).
+
+## Recall-first injection (the context/prepare default)
+
+Retention decides what the vault *keeps*; injection decides what a turn
+*sees*. Since #356/#366, `mimir_context` and `perseus-vault prepare` are
+**recall-first** (`mode: on_demand`) by default:
+
+- Only entities topically relevant to the supplied `query` (the current
+  task/message) are injected — matched via `recall_when` triggers and
+  stopword-filtered keyword search, workspace-scoped when a
+  `workspace_hash` is supplied. A high `retrieval_count` still ranks
+  entities *within* the matched set, but can no longer push a topically
+  unrelated memory into context at all.
+- Without a `query`, no topical entities are injected — the block is a
+  compact retrieval pointer, byte-stable across unrelated vault writes.
+- Output is clamped to a per-model character budget: 1500 chars by default,
+  6000 for large-window ("opus") hosts, `max_context_chars` to override.
+- The always-on set is hard-capped at 5 entities (see the exemptions table);
+  overflow truncates and emits a warning.
+- Injected blocks are framed as *informational* memory, not authoritative
+  instructions.
+
+The legacy unconditional top-N dump remains available as an explicit opt-in
+(`mode: "always_inject"` on `mimir_context`, `--legacy-context` on
+`prepare`) and is unclamped unless a budget is passed. The gRPC `context`
+RPC keeps the legacy semantics for wire compatibility.
 
 ## Semantic recall and reinforcement
 

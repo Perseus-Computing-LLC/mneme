@@ -1189,6 +1189,22 @@ impl Database {
     /// forgetting curve. Well above the 0.05 archive threshold.
     const VERIFIED_DECAY_FLOOR: f64 = 0.2;
 
+    /// Recall-first context budgets (#366): default character clamp for
+    /// `context`/`prepare` output in on_demand mode. Sized for a lean
+    /// pointer-plus-relevant-hits block on a 200k-window host — the vault is
+    /// the query layer, not a standing blob in the system prompt.
+    pub const DEFAULT_CONTEXT_BUDGET_CHARS: i64 = 1500;
+
+    /// Budget profile for large-window hosts (model name containing "opus").
+    /// More room, same on_demand posture.
+    pub const OPUS_CONTEXT_BUDGET_CHARS: i64 = 6000;
+
+    /// Hard cap on always-on entities injected by a recall-first context
+    /// block (#366). always_on remains supported for identity-critical
+    /// facts, but is the exception: beyond this cap the set is truncated and
+    /// a warning is emitted (prefer recall_when triggers).
+    pub const ALWAYS_ON_CONTEXT_CAP: i64 = 5;
+
     /// Decay score below which an entity is auto-archived by the forgetting
     /// curve. Shared by `decay_tick`, `cohere`, and the `autocohere` compact
     /// step so all three forget at the same point — previously autocohere
@@ -4742,20 +4758,86 @@ last_accessed: {}
         })
     }
 
-    /// Return a pre-formatted context block of top entities for session injection.
-    /// `workspace_hash`: when set, only entities with a matching workspace_hash are
-    /// included — same exact-match semantics as `recall` (v1.2.0 scoping). Without
-    /// it, a federated vault leaks every workspace's memory into the block.
+    /// Legacy `context` entry point — preserved signature for the gRPC
+    /// surface and older callers. Delegates to `context_block` in explicit
+    /// `AlwaysInject` mode (the pre-#356 unconditional top-N dump), with no
+    /// budget clamping, so existing consumers keep the legacy behavior (the
+    /// only addition is the one-line informational framing note, #356).
+    /// New callers should use `context_block` with `ContextMode::OnDemand`
+    /// (the recall-first default of `mimir_context` and `prepare`).
+    // Only the feature-gated gRPC surface (and tests) still call this wrapper.
+    #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
     pub fn context(
         &self,
         categories: &[String],
         limit: i64,
         workspace_hash: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let mut all_entities = Vec::new();
-        let ws = workspace_hash.map(str::to_string);
+        let opts = crate::models::ContextOptions {
+            categories: categories.to_vec(),
+            limit,
+            workspace_hash: workspace_hash.map(str::to_string),
+            mode: crate::models::ContextMode::AlwaysInject,
+            ..Default::default()
+        };
+        Ok(self.context_block(&opts)?.markdown)
+    }
 
-        // #104: Always-on entities — injected unconditionally, before query results
+    /// Resolve the character budget for a context block (#366).
+    ///
+    /// Precedence: explicit `max_context_chars` > model profile > default.
+    /// Profiles are substring matches on the (lowercased) model name so
+    /// versioned ids like "claude-opus-4-8" resolve without an exact table:
+    /// large-window models ("opus") get `OPUS_CONTEXT_BUDGET_CHARS`; every
+    /// other/unknown model falls back to `DEFAULT_CONTEXT_BUDGET_CHARS` —
+    /// the mode is on_demand either way, only the clamp differs.
+    pub fn resolve_context_budget(model: Option<&str>, explicit: Option<i64>) -> i64 {
+        if let Some(chars) = explicit {
+            return chars.clamp(200, 200_000);
+        }
+        match model {
+            Some(m) if m.to_ascii_lowercase().contains("opus") => Self::OPUS_CONTEXT_BUDGET_CHARS,
+            _ => Self::DEFAULT_CONTEXT_BUDGET_CHARS,
+        }
+    }
+
+    /// Build a context/prepare injection block (#356/#366).
+    ///
+    /// `OnDemand` (default): recall-first. The block holds (a) the always-on
+    /// set, hard-capped at `ALWAYS_ON_CONTEXT_CAP` entities, and (b) only
+    /// entities topically relevant to `opts.query` — recall_when trigger
+    /// matches plus stopword-filtered FTS keyword matches. No query = no
+    /// topical injection, just a compact retrieval pointer (byte-stable
+    /// across unrelated writes, so a host's system-prompt prefix doesn't
+    /// churn). Output is clamped to the resolved character budget.
+    ///
+    /// `AlwaysInject` (legacy opt-in): the pre-#356 unconditional top-N dump
+    /// ranked by retrieval_count/recency. Unclamped unless the caller passes
+    /// an explicit `max_context_chars`.
+    ///
+    /// Both modes scope by `workspace_hash` when supplied (including the
+    /// always-on set) and render entity fields through
+    /// `sanitize_prompt_field`.
+    pub fn context_block(
+        &self,
+        opts: &crate::models::ContextOptions,
+    ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
+        use crate::models::ContextMode;
+        let ws = opts.workspace_hash.clone();
+        let on_demand = opts.mode == ContextMode::OnDemand;
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Budget: on_demand always clamps (explicit > model profile > default);
+        // legacy always_inject clamps only when explicitly asked (back-compat).
+        let budget: i64 = if on_demand {
+            Self::resolve_context_budget(opts.model.as_deref(), opts.max_context_chars)
+        } else {
+            opts.max_context_chars
+                .map(|c| c.clamp(200, 200_000))
+                .unwrap_or(0)
+        };
+
+        // #104: Always-on entities — workspace-scoped, read-only.
         let always_on_params = RecallParams {
             always_on: Some(true),
             limit: 50,
@@ -4763,66 +4845,192 @@ last_accessed: {}
             workspace_hash: ws.clone(),
             ..RecallParams::default()
         };
-        let always_on_entities = self.recall(&always_on_params)?;
+        let mut always_on_entities = self.recall(&always_on_params)?;
+        // #366: recall-first hard-caps the always-on set — it is the
+        // exception for identity-critical facts, not a standing dump.
+        if on_demand && always_on_entities.len() as i64 > Self::ALWAYS_ON_CONTEXT_CAP {
+            warnings.push(format!(
+                "always_on set exceeds the recall-first cap ({} > {}); only the top {} were injected. \
+                 Prefer recall_when triggers over always_on (see docs/retention.md).",
+                always_on_entities.len(),
+                Self::ALWAYS_ON_CONTEXT_CAP,
+                Self::ALWAYS_ON_CONTEXT_CAP,
+            ));
+            always_on_entities.truncate(Self::ALWAYS_ON_CONTEXT_CAP as usize);
+        }
 
-        if categories.is_empty() {
-            // No filter — get top entities overall (read-only, no side effects)
-            let params = RecallParams {
-                limit,
-                skip_side_effects: true,
-                workspace_hash: ws.clone(),
-                ..RecallParams::default()
-            };
-            all_entities = self.recall(&params)?;
+        // Topical body.
+        let query = opts
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        let mut body_entities: Vec<crate::models::Entity> = Vec::new();
+        if on_demand {
+            // #356: relevance-gated injection. Only entities that match the
+            // current query — via recall_when triggers or meaning-bearing
+            // keyword terms — may enter the block. retrieval_count still
+            // ranks *within* the matched set, but can no longer promote a
+            // topically unrelated entity into context at all.
+            if let Some(q) = query {
+                let mut hits = self.recall_when(q, opts.limit, ws.as_deref())?;
+
+                // Keyword arm: drop stopwords/short words so "can I eat after
+                // a sermorelin injection" matches on "sermorelin injection",
+                // not on "can*"/"after*" prefix noise.
+                let content_words: Vec<String> = q
+                    .split_whitespace()
+                    .filter(|w| w.len() >= 3 && !is_stopword(&w.to_lowercase()))
+                    .map(str::to_string)
+                    .collect();
+                if !content_words.is_empty() {
+                    let kw_query = content_words.join(" ");
+                    let cats: Vec<Option<String>> = if opts.categories.is_empty() {
+                        vec![None]
+                    } else {
+                        opts.categories.iter().cloned().map(Some).collect()
+                    };
+                    for cat in cats {
+                        let params = RecallParams {
+                            query: kw_query.clone(),
+                            category: cat,
+                            limit: opts.limit,
+                            skip_side_effects: true,
+                            workspace_hash: ws.clone(),
+                            ..RecallParams::default()
+                        };
+                        for e in self.recall(&params)? {
+                            if !hits.iter().any(|h| h.id == e.id) {
+                                hits.push(e);
+                            }
+                        }
+                    }
+                }
+
+                if !opts.categories.is_empty() {
+                    hits.retain(|e| opts.categories.contains(&e.category));
+                }
+                hits.truncate(opts.limit.max(0) as usize);
+                body_entities = hits;
+            }
         } else {
-            for cat in categories {
+            // Legacy dump: top entities by retrieval_count/recency.
+            if opts.categories.is_empty() {
                 let params = RecallParams {
-                    category: Some(cat.clone()),
-                    limit,
+                    limit: opts.limit,
                     skip_side_effects: true,
                     workspace_hash: ws.clone(),
                     ..RecallParams::default()
                 };
-                let mut batch = self.recall(&params)?;
-                all_entities.append(&mut batch);
+                body_entities = self.recall(&params)?;
+            } else {
+                for cat in &opts.categories {
+                    let params = RecallParams {
+                        category: Some(cat.clone()),
+                        limit: opts.limit,
+                        skip_side_effects: true,
+                        workspace_hash: ws.clone(),
+                        ..RecallParams::default()
+                    };
+                    let mut batch = self.recall(&params)?;
+                    body_entities.append(&mut batch);
+                }
             }
         }
+        // Never render the same entity twice (always-on section wins), and
+        // honor the caller's exclusions (prepare's own recall_when section).
+        body_entities.retain(|e| {
+            !always_on_entities.iter().any(|a| a.id == e.id)
+                && !opts.exclude_ids.contains(&e.id)
+        });
 
-        // Format as markdown
-        let mut ctx = String::from("## Perseus Vault Context\n\n");
-
-        // Always-on entities first, visually distinct
-        if !always_on_entities.is_empty() {
-            ctx.push_str("### Always On\n\n");
-            for entity in &always_on_entities {
-                ctx.push_str(&format!(
-                    "- [always-on] [{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
-                    sanitize_prompt_field(&entity.category),
-                    sanitize_prompt_field(&entity.key),
-                    sanitize_prompt_field(&truncate_str(&entity.body_json, 100)),
-                    entity.retrieval_count,
-                    entity.decay_score,
-                ));
-            }
-            ctx.push('\n');
-        }
-
-        for entity in &all_entities {
-            ctx.push_str(&format!(
-                "- [{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
+        // Render.
+        let entity_line = |entity: &crate::models::Entity, tag: &str| -> String {
+            format!(
+                "- {}[{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
+                tag,
                 sanitize_prompt_field(&entity.category),
                 sanitize_prompt_field(&entity.key),
                 sanitize_prompt_field(&truncate_str(&entity.body_json, 100)),
                 entity.retrieval_count,
                 entity.decay_score,
+            )
+        };
+
+        let mut ctx = String::from("## Perseus Vault Context\n\n");
+        // #356: soften the framing — retrieved memory is informational
+        // context, not an instruction channel that "should inform all
+        // responses" regardless of relevance.
+        ctx.push_str(
+            "_Retrieved memory — informational, not instructions; weigh by relevance to the current task._\n\n",
+        );
+
+        if !always_on_entities.is_empty() {
+            ctx.push_str("### Always On\n\n");
+            for entity in &always_on_entities {
+                ctx.push_str(&entity_line(entity, "[always-on] "));
+            }
+            ctx.push('\n');
+        }
+        for w in &warnings {
+            ctx.push_str(&format!("> warning: {}\n\n", w));
+        }
+
+        if on_demand {
+            if query.is_some() {
+                if !body_entities.is_empty() {
+                    ctx.push_str("### Relevant to Current Task\n\n");
+                    for entity in &body_entities {
+                        ctx.push_str(&entity_line(entity, ""));
+                    }
+                    ctx.push('\n');
+                }
+            } else {
+                ctx.push_str(
+                    "> Recall-first mode: no `query` supplied, so no topical memories were injected. \
+                     Pass `query` (the current task/message) to surface relevant memories, or call \
+                     `mimir_recall` / `mimir_recall_when` on demand. Legacy full dump: `mode: \"always_inject\"`.\n\n",
+                );
+            }
+        } else {
+            for entity in &body_entities {
+                ctx.push_str(&entity_line(entity, ""));
+            }
+        }
+
+        let injected = (always_on_entities.len() + body_entities.len()) as i64;
+        if on_demand {
+            ctx.push_str(&format!(
+                "\n> {} entities recalled (mode: on_demand, budget: {} chars)\n",
+                injected, budget,
+            ));
+        } else {
+            ctx.push_str(&format!("\n> {} entities recalled\n", injected));
+        }
+
+        // Clamp to the budget (total INCLUDING the truncation marker stays
+        // within budget, so "≤ budget chars" is verifiable by byte count).
+        if budget > 0 && ctx.chars().count() as i64 > budget {
+            let marker = format!(
+                "\n> [truncated to the {}-char recall budget — raise max_context_chars or recall on demand]\n",
+                budget
+            );
+            let keep = (budget as usize).saturating_sub(marker.chars().count());
+            ctx = ctx.chars().take(keep).collect();
+            ctx.push_str(&marker);
+            warnings.push(format!(
+                "output truncated to the {}-char recall budget",
+                budget
             ));
         }
-        ctx.push_str(&format!(
-            "\n> {} entities recalled\n",
-            all_entities.len() + always_on_entities.len()
-        ));
 
-        Ok(ctx)
+        Ok(crate::models::ContextBlock {
+            markdown: ctx,
+            mode: opts.mode.as_str().to_string(),
+            budget_chars: budget,
+            entities_injected: injected,
+            warnings,
+        })
     }
 
     /// List all distinct categories in the entities table.
@@ -7488,6 +7696,379 @@ mod tests {
         // Unscoped call keeps the old behavior: everything visible.
         let all = db.context(&[], 10, None).unwrap();
         assert!(all.contains("alpha-secret") && all.contains("beta-secret"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #356 live repro, encoded: a personal-health query must not be served
+    /// cron-debug writeups or credential-redaction notes just because those
+    /// have high retrieval counts. Recall-first context only admits entities
+    /// that topically match the query (recall_when trigger or keyword).
+    #[test]
+    fn context_on_demand_gates_by_topical_relevance() {
+        let (db, path) = temp_db();
+
+        db.remember(&make_entity(
+            "rel-1",
+            "health",
+            "sermorelin-timing",
+            r#"{"recall_when":["sermorelin","peptide dosing"],"note":"avoid food 30 min around dose"}"#,
+        ))
+        .unwrap();
+        // The exact noise classes from the live repro — high retrieval_count,
+        // zero topical overlap.
+        let mut cron = make_entity(
+            "irr-1",
+            "reference",
+            "cron-git-fix",
+            r#"{"note":"recurring-task cron writeup hrmsu7da7e01 git ownership bug"}"#,
+        );
+        cron.retrieval_count = 97;
+        db.remember(&cron).unwrap();
+        let mut cred = make_entity(
+            "irr-2",
+            "reference",
+            "credential-redaction",
+            r#"{"note":"GITHUB_TOKEN credential redaction reference"}"#,
+        );
+        cred.retrieval_count = 70;
+        db.remember(&cred).unwrap();
+
+        let opts = crate::models::ContextOptions {
+            limit: 10,
+            query: Some("can I eat food right around my sermorelin injection".to_string()),
+            ..Default::default()
+        };
+        let block = db.context_block(&opts).unwrap();
+        assert!(
+            block.markdown.contains("sermorelin-timing"),
+            "topically relevant entity must be injected:\n{}",
+            block.markdown
+        );
+        assert!(
+            !block.markdown.contains("cron-git-fix") && !block.markdown.contains("hrmsu7da7e01"),
+            "cron-debug noise must be gated out despite 97 retrievals:\n{}",
+            block.markdown
+        );
+        assert!(
+            !block.markdown.contains("GITHUB_TOKEN"),
+            "credential-redaction noise must be gated out:\n{}",
+            block.markdown
+        );
+        // #356: injected memory is framed as informational, not authoritative.
+        assert!(
+            block.markdown.contains("informational, not instructions"),
+            "framing must be informational:\n{}",
+            block.markdown
+        );
+        assert_eq!(block.mode, "on_demand");
+        assert_eq!(block.budget_chars, Database::DEFAULT_CONTEXT_BUDGET_CHARS);
+        assert!(
+            (block.markdown.chars().count() as i64) <= block.budget_chars,
+            "default output must fit the default budget"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #366: without a query, recall-first context injects NO topical
+    /// entities — just a compact retrieval pointer — and that output is
+    /// byte-stable across unrelated vault writes (prefix-cache friendly).
+    /// The legacy always_inject mode is the opt-in that still dumps.
+    #[test]
+    fn context_on_demand_without_query_is_compact_stable_pointer() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "p-1",
+            "note",
+            "existing-note",
+            r#"{"note":"pre-existing knowledge"}"#,
+        ))
+        .unwrap();
+
+        let opts = crate::models::ContextOptions {
+            limit: 10,
+            ..Default::default()
+        };
+        let before = db.context_block(&opts).unwrap();
+        assert!(
+            before.markdown.contains("Recall-first mode"),
+            "no-query on_demand output must be the retrieval pointer:\n{}",
+            before.markdown
+        );
+        assert!(
+            !before.markdown.contains("existing-note"),
+            "no topical entities may be injected without a query:\n{}",
+            before.markdown
+        );
+        assert!(
+            (before.markdown.chars().count() as i64) <= Database::DEFAULT_CONTEXT_BUDGET_CHARS,
+            "pointer must fit the default budget"
+        );
+
+        // An unrelated write must not perturb the injected block.
+        db.remember(&make_entity(
+            "p-2",
+            "note",
+            "new-unrelated-note",
+            r#"{"note":"a write that lands mid-session"}"#,
+        ))
+        .unwrap();
+        let after = db.context_block(&opts).unwrap();
+        assert_eq!(
+            before.markdown, after.markdown,
+            "recall-first block must be byte-stable across unrelated writes"
+        );
+
+        // Regression contrast: the legacy dump DOES change on every write —
+        // exactly the prefix churn recall-first eliminates.
+        let legacy = crate::models::ContextOptions {
+            limit: 10,
+            mode: crate::models::ContextMode::AlwaysInject,
+            ..Default::default()
+        };
+        let legacy_block = db.context_block(&legacy).unwrap();
+        assert!(
+            legacy_block.markdown.contains("new-unrelated-note")
+                && legacy_block.markdown.contains("existing-note"),
+            "legacy opt-in must keep the unconditional dump:\n{}",
+            legacy_block.markdown
+        );
+        assert_eq!(legacy_block.mode, "always_inject");
+        assert_eq!(legacy_block.budget_chars, 0, "legacy output is unclamped by default");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #356: on_demand relevance gating composes with workspace scoping —
+    /// a topical match in another workspace must still be invisible.
+    #[test]
+    fn context_on_demand_query_scopes_to_workspace() {
+        let (db, path) = temp_db();
+        let mut theirs = make_entity(
+            "ws-q-1",
+            "health",
+            "their-sermorelin-note",
+            r#"{"recall_when":["sermorelin"],"note":"beta workspace fact"}"#,
+        );
+        theirs.workspace_hash = "ws-beta".to_string();
+        db.remember(&theirs).unwrap();
+        let mut mine = make_entity(
+            "ws-q-2",
+            "health",
+            "my-sermorelin-note",
+            r#"{"recall_when":["sermorelin"],"note":"alpha workspace fact"}"#,
+        );
+        mine.workspace_hash = "ws-alpha".to_string();
+        db.remember(&mine).unwrap();
+
+        let opts = crate::models::ContextOptions {
+            limit: 10,
+            workspace_hash: Some("ws-alpha".to_string()),
+            query: Some("sermorelin dosing".to_string()),
+            ..Default::default()
+        };
+        let block = db.context_block(&opts).unwrap();
+        assert!(
+            block.markdown.contains("my-sermorelin-note"),
+            "own workspace's relevant entity must appear:\n{}",
+            block.markdown
+        );
+        assert!(
+            !block.markdown.contains("their-sermorelin-note"),
+            "topical match in another workspace must not leak:\n{}",
+            block.markdown
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #366: output is clamped to the resolved character budget, with a
+    /// truncation marker inside the budget and a warning in metadata.
+    #[test]
+    fn context_budget_clamps_output_and_warns() {
+        let (db, path) = temp_db();
+        // Insert directly (bypassing remember()'s 0.7 trigram dedup — these
+        // bodies are deliberately near-identical), including the FTS rows the
+        // relevance gate matches against.
+        let conn = db.conn().unwrap();
+        for i in 0..20 {
+            let id = format!("bud-{}", i);
+            let body = format!(
+                r#"{{"recall_when":["kubernetes"],"note":"kubernetes rollout detail number {:02} with plenty of padding text"}}"#,
+                i
+            );
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                 decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                 links, verified, source, created_at_unix_ms, last_accessed_unix_ms) \
+                 VALUES (?1, 'note', ?2, ?3, 'active', 'insight', '[]', 1.0, 0, 'buffer', '', \
+                 0, '', '[]', 0, 'test', 0, 0)",
+                params![id, format!("kubernetes-note-{:02}", i), body],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entities_fts (rowid, body_json) \
+                 VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                params![id, body],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let opts = crate::models::ContextOptions {
+            limit: 20,
+            query: Some("kubernetes deployment".to_string()),
+            max_context_chars: Some(400),
+            ..Default::default()
+        };
+        let block = db.context_block(&opts).unwrap();
+        assert_eq!(block.budget_chars, 400);
+        assert!(
+            (block.markdown.chars().count() as i64) <= 400,
+            "clamped output must fit the budget, got {} chars",
+            block.markdown.chars().count()
+        );
+        assert!(
+            block.markdown.contains("truncated"),
+            "truncation must be visible in the block:\n{}",
+            block.markdown
+        );
+        assert!(
+            block.warnings.iter().any(|w| w.contains("truncated")),
+            "truncation must be reported in warnings: {:?}",
+            block.warnings
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #366: deterministic budget-profile resolution — explicit override >
+    /// model profile > default; opus-class hosts admit more, everyone else
+    /// stays lean.
+    #[test]
+    fn context_budget_profiles_resolve_deterministically() {
+        assert_eq!(
+            Database::resolve_context_budget(None, None),
+            Database::DEFAULT_CONTEXT_BUDGET_CHARS
+        );
+        assert_eq!(
+            Database::resolve_context_budget(Some("claude-sonnet-4-6"), None),
+            Database::DEFAULT_CONTEXT_BUDGET_CHARS
+        );
+        assert_eq!(
+            Database::resolve_context_budget(Some("claude-opus-4-8"), None),
+            Database::OPUS_CONTEXT_BUDGET_CHARS
+        );
+        assert_eq!(
+            Database::resolve_context_budget(Some("totally-unknown-model"), None),
+            Database::DEFAULT_CONTEXT_BUDGET_CHARS
+        );
+        // Explicit budget beats the profile; absurd values are clamped sane.
+        assert_eq!(Database::resolve_context_budget(Some("claude-opus-4-8"), Some(2000)), 2000);
+        assert_eq!(Database::resolve_context_budget(None, Some(50)), 200);
+        assert_eq!(Database::resolve_context_budget(None, Some(10_000_000)), 200_000);
+    }
+
+    /// #366: always_on still works but is a capped exception under
+    /// recall-first — overflow truncates to the cap and emits the
+    /// documented warning steering users to recall_when.
+    #[test]
+    fn context_on_demand_caps_always_on_set_and_warns() {
+        let (db, path) = temp_db();
+        let bodies = [
+            "identity alpha", "deploy region eu", "billing plan pro", "primary language rust",
+            "release cadence weekly", "oncall rotation blue", "vault encryption enabled",
+            "timezone utc plus one",
+        ];
+        for (i, b) in bodies.iter().enumerate() {
+            let mut e = make_entity(
+                &format!("ao-{}", i),
+                "identity",
+                &format!("ao-fact-{}", i),
+                &format!(r#"{{"note":"{}"}}"#, b),
+            );
+            e.always_on = true;
+            db.remember(&e).unwrap();
+        }
+
+        let opts = crate::models::ContextOptions {
+            limit: 10,
+            ..Default::default()
+        };
+        let block = db.context_block(&opts).unwrap();
+        assert_eq!(
+            block.markdown.matches("[always-on]").count() as i64,
+            Database::ALWAYS_ON_CONTEXT_CAP,
+            "always-on set must be hard-capped:\n{}",
+            block.markdown
+        );
+        assert!(
+            block
+                .warnings
+                .iter()
+                .any(|w| w.contains("always_on set exceeds the recall-first cap")),
+            "overflow must emit the documented warning: {:?}",
+            block.warnings
+        );
+        assert!(
+            block.markdown.contains("recall_when"),
+            "warning must steer toward recall_when triggers:\n{}",
+            block.markdown
+        );
+
+        // Legacy opt-in keeps the full always-on set (no cap, no warning).
+        let legacy = crate::models::ContextOptions {
+            limit: 10,
+            mode: crate::models::ContextMode::AlwaysInject,
+            ..Default::default()
+        };
+        let legacy_block = db.context_block(&legacy).unwrap();
+        assert_eq!(legacy_block.markdown.matches("[always-on]").count(), bodies.len());
+        assert!(legacy_block.warnings.is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #366 round-trip acceptance: entities that previously needed an
+    /// always-on dump to be visible are returned by recall_when-gated
+    /// context when the task actually touches them.
+    #[test]
+    fn context_recall_when_round_trip_replaces_always_on_dump() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "rt-1",
+            "convention",
+            "deploy-rule",
+            r#"{"recall_when":["deploying","release"],"summary":"run canary suite first"}"#,
+        ))
+        .unwrap();
+
+        // Not in context for an unrelated turn…
+        let unrelated = crate::models::ContextOptions {
+            limit: 10,
+            query: Some("summarize quarterly finances".to_string()),
+            ..Default::default()
+        };
+        let miss = db.context_block(&unrelated).unwrap();
+        assert!(
+            !miss.markdown.contains("deploy-rule"),
+            "unrelated turn must not inject the deploy rule:\n{}",
+            miss.markdown
+        );
+
+        // …but fires exactly when the task matches its triggers.
+        let related = crate::models::ContextOptions {
+            limit: 10,
+            query: Some("deploying the payments service".to_string()),
+            ..Default::default()
+        };
+        let hit = db.context_block(&related).unwrap();
+        assert!(
+            hit.markdown.contains("deploy-rule"),
+            "matching turn must inject the deploy rule:\n{}",
+            hit.markdown
+        );
 
         let _ = fs::remove_file(&path);
     }

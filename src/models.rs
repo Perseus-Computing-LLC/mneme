@@ -313,6 +313,77 @@ impl Default for RecallParams {
     }
 }
 
+/// Injection posture for `context`/`prepare` blocks (#366).
+///
+/// `OnDemand` (the default) is recall-first: the block contains a hard-capped
+/// always-on set plus entities that are *topically relevant to the supplied
+/// query* (recall_when trigger matches + stopword-filtered keyword matches),
+/// clamped to a per-model character budget. Without a query, no topical
+/// entities are injected at all — the block is a compact retrieval pointer,
+/// which also keeps it byte-stable across unrelated vault writes
+/// (prefix-cache friendly).
+///
+/// `AlwaysInject` is the legacy pre-#356 behavior — unconditional top-N
+/// dump ranked by retrieval_count/recency, no relevance gating — kept as an
+/// explicit opt-in for backward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextMode {
+    #[default]
+    OnDemand,
+    AlwaysInject,
+}
+
+impl ContextMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContextMode::OnDemand => "on_demand",
+            ContextMode::AlwaysInject => "always_inject",
+        }
+    }
+}
+
+/// Options for building a `context`/`prepare` injection block (#356/#366).
+#[derive(Debug, Clone, Default)]
+pub struct ContextOptions {
+    /// Categories to include. Empty = all categories.
+    pub categories: Vec<String>,
+    /// Max topical entities in the block body.
+    pub limit: i64,
+    /// Workspace scope filter — same exact-match semantics as recall.
+    pub workspace_hash: Option<String>,
+    /// Current task/message text. In `OnDemand` mode this is the relevance
+    /// gate: only entities whose `recall_when` triggers or indexed content
+    /// match it are injected. Ignored in `AlwaysInject` mode.
+    pub query: Option<String>,
+    /// Injection posture. Defaults to recall-first (`OnDemand`).
+    pub mode: ContextMode,
+    /// Explicit character budget for the rendered block. Overrides `model`
+    /// profile resolution. In `AlwaysInject` mode clamping only happens when
+    /// this is set (legacy output is otherwise unclamped).
+    pub max_context_chars: Option<i64>,
+    /// Host model name for budget-profile resolution (e.g.
+    /// "claude-opus-4-8"). Unknown/absent models use the default profile.
+    pub model: Option<String>,
+    /// Entity ids to exclude from the topical section (used by `prepare`,
+    /// which renders recall_when hits in its own section and must not show
+    /// them twice).
+    pub exclude_ids: Vec<String>,
+}
+
+/// A rendered context block plus injection metadata (#366).
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextBlock {
+    pub markdown: String,
+    /// "on_demand" or "always_inject".
+    pub mode: String,
+    /// Resolved character budget (0 = unclamped legacy output).
+    pub budget_chars: i64,
+    /// Number of entities actually injected (always-on + topical).
+    pub entities_injected: i64,
+    /// Soft warnings: always-on cap overflow, budget truncation.
+    pub warnings: Vec<String>,
+}
+
 /// Parameters for timeline queries over the journal.
 pub struct TimelineParams {
     pub from_ms: Option<i64>,

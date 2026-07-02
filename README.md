@@ -163,7 +163,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_ask` | RAG: recall context, query LLM, return grounded answer with sources. |
 | `mimir_embed` | Generate dense vectors via the bundled model, Ollama, or OpenAI-compatible endpoint. |
 | `mimir_semantic_search` | Dense-only semantic search shortcut — find entities by meaning, ranked purely by embedding similarity (no keyword fallback). |
-| `mimir_context` | Pre-formatted markdown block for session injection. |
+| `mimir_context` | Pre-formatted markdown block for session injection. Recall-first by default: pass `query` (the current task/message) and only topically relevant entities are injected, clamped to a per-model budget; the legacy unconditional dump requires `mode: "always_inject"`. |
 | `mimir_ingest` | Trigger connector syncs (GitHub, file watcher). |
 | `mimir_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
 | `mimir_extract` | Local, deterministic, rule-based knowledge extraction (facts / preferences / temporal events / episodes) from text or a stored entity. Read-only. |
@@ -377,7 +377,33 @@ You can interact with these layers directly using the `mimir_recall_layer` tool 
 - **Ebbinghaus decay** — memories naturally fade unless retrieved (refresh on access)
 - **Layer promotion** — buffer → working → core based on access frequency
 - **Automatic archival** — stale entities archive; purge to permanently delete + VACUUM
-- **Always-on entities** — pin critical memories for unconditional session injection
+- **Always-on entities** — pin identity-critical memories for session injection (hard-capped under recall-first; prefer `recall_when` triggers)
+
+### Recall-First Context Injection
+
+The vault is the query layer — it retrieves the few facts a turn needs instead of
+handing the host a standing blob to staple into every system prompt.
+`mimir_context` and `perseus-vault prepare` are **recall-first by default**:
+
+- **Relevance gating** — pass `query` (the current task/message) and only entities
+  whose `recall_when` triggers or indexed content match it are injected. No query,
+  no topical injection: the block is a compact retrieval pointer, byte-stable
+  across unrelated vault writes (prefix-cache friendly).
+- **Per-model recall budget** — output is clamped to a character budget resolved
+  from the host model: default/lean profile 1500 chars; large-window ("opus")
+  profile 6000 chars; `max_context_chars` overrides both.
+- **Capped always-on** — `always_on: true` still works for identity-critical
+  facts, but the recall-first set is hard-capped (top 5) and overflow emits a
+  warning steering you to `recall_when` triggers.
+- **Legacy opt-in** — the old unconditional top-N dump is still available with
+  `mode: "always_inject"` (`--legacy-context` for `prepare`), unclamped unless
+  you pass a budget.
+
+```bash
+perseus-vault prepare --task "deploying the payments service" --model claude-sonnet-4-6
+perseus-vault prepare --task "..." --max-context-chars 800     # explicit budget
+perseus-vault prepare --task "..." --legacy-context            # old dump, opt-in
+```
 
 ### RAG & Embeddings
 - **`mimir_ask`** — natural language Q&A over stored memories via any LLM (Ollama, OpenAI, etc.)
