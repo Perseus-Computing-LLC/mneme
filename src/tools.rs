@@ -2822,6 +2822,94 @@ mod tests {
     }
 
     #[test]
+    fn remember_rejects_one_sided_past_valid_to() {
+        // #363 review (round 2): with valid_from omitted it defaults to "now"
+        // (new entity / content change) or the stored period (identical
+        // re-assert) — a past valid_to would silently store an inverted
+        // period that valid_at can never match while still shadowing older
+        // versions in bitemporal_at.
+        let (db, path) = temp_db();
+        let past = now_ms() - 60_000;
+
+        // (a) New entity: effective period would be [now, past).
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "one-sided", "body_json": "{\"note\":\"v1\"}",
+                   "valid_to_unix_ms": past}),
+        )
+        .expect_err("one-sided past valid_to on a new entity must be rejected");
+        assert!(err.contains("valid_to_unix_ms"), "got: {err}");
+        // Nothing was written.
+        assert!(
+            db.get_entity("facts", "one-sided").unwrap().is_none(),
+            "rejected remember must not create an entity"
+        );
+
+        // (b) Existing entity, content change: the new version's valid_from
+        // defaults to now — same inversion.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "one-sided", "body_json": "{\"note\":\"v1\"}"}),
+        )
+        .expect("baseline");
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "one-sided", "body_json": "{\"note\":\"v2\"}",
+                   "valid_to_unix_ms": past}),
+        )
+        .expect_err("one-sided past valid_to on a content change must be rejected");
+        assert!(err.contains("valid_to_unix_ms"), "got: {err}");
+        // Rejected BEFORE mutation: v1 is still the live body.
+        let body = db.get_entity("facts", "one-sided").unwrap().unwrap().body_json;
+        assert!(body.contains("v1"), "rejected write must not update the entity: {body}");
+
+        // (c) Existing entity, identical body (COALESCE re-assert path):
+        // valid_to is validated against the STORED valid_from.
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "one-sided", "body_json": "{\"note\":\"v1\"}",
+                   "valid_to_unix_ms": past}),
+        )
+        .expect_err("one-sided past valid_to on an identical re-assert must be rejected");
+        assert!(err.contains("valid_to_unix_ms"), "got: {err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_accepts_one_sided_future_valid_to() {
+        // A one-sided FUTURE valid_to is a real interval [now, future) — an
+        // expiring fact — and must keep working.
+        let (db, path) = temp_db();
+        let future = now_ms() + 3_600_000;
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "expiring", "body_json": "{\"note\":\"v1\"}",
+                   "valid_to_unix_ms": future}),
+        )
+        .expect("one-sided future valid_to on a new entity must be accepted");
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "expiring", "body_json": "{\"note\":\"v2\"}",
+                   "valid_to_unix_ms": future}),
+        )
+        .expect("one-sided future valid_to on a content change must be accepted");
+
+        // The stored period is answerable right now and carries the bound.
+        let r = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "expiring", "valid_at_unix_ms": now_ms()}),
+        )
+        .expect("valid_at");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(future), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn bitemporal_tool_reports_both_axes() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -3128,6 +3216,26 @@ mod tests {
                    "valid_from_unix_ms": 200, "valid_to_unix_ms": 100}),
         )
         .expect_err("inverted period must be rejected on correct");
+        assert!(err.contains("valid_to_unix_ms"), "got: {err}");
+        // Nothing was written.
+        let r = handle_recall(&db, json!({"query": "", "category": "correction", "mode": "fts5"}))
+            .unwrap_or_else(|_| "{\"total\":0}".to_string());
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["total"], json!(0), "rejected correct must not create an entity: {r}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn correct_rejects_one_sided_past_valid_to() {
+        // #363 review (round 2): same one-sided guard on the correct surface —
+        // valid_from omitted defaults to now, so a past valid_to inverts.
+        let (db, path) = temp_db();
+        let err = handle_correct(
+            &db,
+            json!({"wrong_approach": "w", "user_correction": "c", "task_context": "t",
+                   "valid_to_unix_ms": now_ms() - 60_000}),
+        )
+        .expect_err("one-sided past valid_to must be rejected on correct");
         assert!(err.contains("valid_to_unix_ms"), "got: {err}");
         // Nothing was written.
         let r = handle_recall(&db, json!({"query": "", "category": "correction", "mode": "fts5"}))

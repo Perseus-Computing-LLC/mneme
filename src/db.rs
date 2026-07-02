@@ -1740,6 +1740,37 @@ impl Database {
                 uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
             );
 
+            // #363 review (round 2): a one-sided `valid_to` must still form a
+            // real half-open [valid_from, valid_to) interval against the
+            // EFFECTIVE valid_from this write will use — `now` on a content
+            // change (the stamp UPDATE below re-sets the period), the stored
+            // period otherwise (the COALESCE keeps it). Without this, a
+            // `remember {valid_to: <past>}` would silently store an inverted
+            // period that valid_at can never match while still shadowing older
+            // versions in bitemporal_at — the exact "unanswerable fact" state
+            // set_valid_to already refuses for the identical defaulted-from
+            // case. Checked BEFORE the transaction so a rejected write mutates
+            // nothing.
+            if let Some(vt) = valid_to {
+                let eff_from: i64 = match valid_from {
+                    Some(vf) => vf,
+                    None if content_changed => now,
+                    None => conn.query_row(
+                        "SELECT COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms) \
+                         FROM entities WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )?,
+                };
+                if vt <= eff_from {
+                    return Err(format!(
+                        "valid_to_unix_ms ({vt}) must be greater than the fact's effective \
+                         valid_from ({eff_from}) — refusing to invert the valid period"
+                    )
+                    .into());
+                }
+            }
+
             // M-1: wrap entity UPDATE + FTS UPDATE in a transaction
             let tx = conn.unchecked_transaction()?;
 
@@ -1842,6 +1873,22 @@ impl Database {
             action = "updated".to_string();
             should_embed = content_changed;
         } else {
+            // #363 review (round 2): same one-sided inversion refusal on the
+            // insert path — with valid_from omitted the INSERT below defaults
+            // it to creation time, so a past valid_to would store [now, past).
+            // Checked before dedup: an inverted period is invalid input and
+            // must error, not silently merge into a near-duplicate.
+            if let Some(vt) = valid_to {
+                let eff_from = valid_from.unwrap_or(entity.created_at_unix_ms);
+                if vt <= eff_from {
+                    return Err(format!(
+                        "valid_to_unix_ms ({vt}) must be greater than the fact's effective \
+                         valid_from ({eff_from}) — refusing to invert the valid period"
+                    )
+                    .into());
+                }
+            }
+
             // Check for near-duplicates before inserting (unless the caller is
             // a file-semantics writer — see remember_skip_dedup).
             let dup_threshold = 0.7; // 70% trigram similarity
