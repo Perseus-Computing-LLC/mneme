@@ -6022,6 +6022,22 @@ Return a JSON object with an "insights" array. Each insight has:
     /// Permanently delete all archived entities and run VACUUM to reclaim disk space.
     /// This is the only way to actually remove entities; prune/forget only soft-archive.
     /// Deleted entities are NOT recoverable. Use dry_run=true to preview first.
+    ///
+    /// #398 — purge now honors its own "actually remove" contract for the two
+    /// append-only side tables that used to survive it:
+    ///   * `entity_history`: every superseded version of a purged entity —
+    ///     matched by live id AND by (category, key, workspace_hash), so
+    ///     versions written under earlier ids of the same key are erased too —
+    ///     is DELETEd. A GDPR-style forget-then-purge no longer leaves the
+    ///     historical bodies readable via mimir_history / mimir_as_of.
+    ///   * `journal`: rows referencing a purged entity (by entity_id or by its
+    ///     category/key) are REDACTED IN PLACE, not deleted. The audit chain
+    ///     hashes only (prev_hash, id, created_at_unix_ms) — see audit_hash —
+    ///     so scrubbing the payload columns (evaluated/acted/forward JSON,
+    ///     category, key, entity_id) and stamping event_type='redacted'
+    ///     preserves end-to-end chain verifiability (verify_audit_chain)
+    ///     while removing every purged body from the log. Deleting the rows
+    ///     instead would break every subsequent link of the chain.
     pub fn purge(&self, dry_run: bool) -> Result<PurgeReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let before_size = match std::fs::metadata(&self.db_path) {
@@ -6029,14 +6045,51 @@ Return a JSON object with an "insights" array. Each insight has:
             Err(_) => 0i64,
         };
 
-        // Count archived entities
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM entities WHERE archived = 1")?;
-        let count: i64 = stmt.query_row([], |r| r.get(0))?;
-        stmt.finalize()?;
+        // Collect the archived rows first: the history/journal cleanup below
+        // needs their identities, and the dry_run report should count the
+        // side-table rows that WOULD be affected.
+        let doomed: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key, workspace_hash FROM entities WHERE archived = 1",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let count = doomed.len() as i64;
+
+        // The matching predicates are identical in dry_run and the real run,
+        // so the preview counts exactly what the real run affects.
+        const HIST_MATCH: &str =
+            "id = ?1 OR (category = ?2 AND key = ?3 AND COALESCE(workspace_hash,'') = ?4)";
+        const JRN_MATCH: &str =
+            "event_type != 'redacted' AND (entity_id = ?1 OR (category = ?2 AND key = ?3 AND key != ''))";
 
         if dry_run {
+            let mut hist = 0i64;
+            let mut jrn = 0i64;
+            for (id, cat, key, ws) in &doomed {
+                hist += conn.query_row(
+                    &format!("SELECT COUNT(*) FROM entity_history WHERE {HIST_MATCH}"),
+                    params![id, cat, key, ws],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                jrn += conn.query_row(
+                    &format!("SELECT COUNT(*) FROM journal WHERE {JRN_MATCH}"),
+                    params![id, cat, key],
+                    |r| r.get::<_, i64>(0),
+                )?;
+            }
             return Ok(PurgeReport {
                 entities_deleted: count,
+                history_rows_deleted: hist,
+                journal_rows_redacted: jrn,
                 bytes_freed: 0,
                 dry_run: true,
                 completed_at_unix_ms: now_ms(),
@@ -6046,18 +6099,38 @@ Return a JSON object with an "insights" array. Each insight has:
         if count == 0 {
             return Ok(PurgeReport {
                 entities_deleted: 0,
+                history_rows_deleted: 0,
+                journal_rows_redacted: 0,
                 bytes_freed: 0,
                 dry_run: false,
                 completed_at_unix_ms: now_ms(),
             });
         }
 
-        // Delete archived entities from FTS5 index first, then the entities table
+        // Delete archived entities from FTS5 index first, then the entities
+        // table, then the #398 side-table cleanup — one transaction, so a
+        // failure can't leave entities gone but their history still readable.
         let tx = conn.unchecked_transaction()?;
         conn.execute_batch(
             "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1);
              DELETE FROM entities WHERE archived = 1;"
         )?;
+        let mut history_deleted = 0i64;
+        let mut journal_redacted = 0i64;
+        for (id, cat, key, ws) in &doomed {
+            history_deleted += conn.execute(
+                &format!("DELETE FROM entity_history WHERE {HIST_MATCH}"),
+                params![id, cat, key, ws],
+            )? as i64;
+            journal_redacted += conn.execute(
+                &format!(
+                    "UPDATE journal SET event_type = 'redacted', evaluated_json = '{{}}', \
+                     acted_json = '{{}}', forward_json = '{{}}', category = '', key = '', \
+                     entity_id = '' WHERE {JRN_MATCH}"
+                ),
+                params![id, cat, key],
+            )? as i64;
+        }
         tx.commit()?;
 
         // VACUUM to reclaim disk space
@@ -6071,10 +6144,275 @@ Return a JSON object with an "insights" array. Each insight has:
 
         Ok(PurgeReport {
             entities_deleted: count,
+            history_rows_deleted: history_deleted,
+            journal_rows_redacted: journal_redacted,
             bytes_freed: freed,
             dry_run: false,
             completed_at_unix_ms: now_ms(),
         })
+    }
+
+    /// #398 — enforce the entity_history retention policy (see
+    /// `HistoryRetentionPolicy`). Mechanism only: with no knobs set this is a
+    /// no-op, so the default behavior stays "keep everything". Runs only from
+    /// maintenance paths (mimir_maintenance, mimir_autocohere, mimir_prune
+    /// scope=history) — never on the write path.
+    ///
+    /// Eviction is strictly oldest-first along the transaction-time axis, so
+    /// for any (category, key, workspace) the evicted rows always form a
+    /// PREFIX of that key's version sequence:
+    ///   * `max_age_days`: rows invalidated before `now - max_age_days`;
+    ///   * `max_versions_per_key`: everything but the newest N stored rows of
+    ///     each key;
+    ///   * `max_bytes`: globally-oldest rows until stored history body bytes
+    ///     (SUM(LENGTH(body_json))) fit the budget.
+    ///
+    /// Tombstone roll-up (issue #398 option 2 — the mode aligned with the
+    /// bi-temporal contract; default ON): each evicted prefix is replaced by
+    /// ONE synthetic history row with status='compacted' / type='tombstone'
+    /// spanning [first_recorded_at, last_invalidated_at) and carrying, in a
+    /// plaintext body (it contains no user content, so it is deliberately not
+    /// encrypted):
+    ///   {"compacted": true, "versions": N, "digest": D, ...}
+    /// N counts the real versions folded in (a re-rolled tombstone
+    /// contributes its stored count, so counts survive successive passes);
+    /// D is a hash chain folded over the evicted rows (seeded by a merged
+    /// tombstone's prior digest). `as_of` at an instant inside the compacted
+    /// window then returns this explicit marker instead of silently-wrong
+    /// data; instants covered by surviving rows are answered exactly as
+    /// before. With tombstones disabled (`MIMIR_HISTORY_TOMBSTONES=0`) the
+    /// prefix is hard-deleted and as_of inside the window finds nothing —
+    /// the degenerate option-1 mode.
+    ///
+    /// dry_run computes the identical eviction set and reports counts/bytes
+    /// without mutating anything.
+    pub fn enforce_history_retention(
+        &self,
+        policy: &crate::models::HistoryRetentionPolicy,
+        dry_run: bool,
+    ) -> Result<crate::models::HistoryRetentionReport, Box<dyn std::error::Error>> {
+        let mut report = crate::models::HistoryRetentionReport {
+            rows_evicted: 0,
+            bytes_evicted: 0,
+            tombstones_written: 0,
+            keys_affected: 0,
+            dry_run,
+            policy: policy.to_json(),
+        };
+        if policy.is_unlimited() {
+            return Ok(report);
+        }
+
+        let conn = self.conn()?;
+        // #379 discipline: selection is read-decide-write over history; take
+        // the writer lock up front so a concurrent supersede can't interleave.
+        // dry_run never commits — the tx drops (rollback) after pure reads.
+        let tx = Self::audited_write_tx(&conn)?;
+        let now = now_ms();
+
+        struct HRow {
+            history_id: String,
+            id: String,
+            cat: String,
+            key: String,
+            ws: String,
+            rec: i64,
+            inv: i64,
+            bytes: i64,
+            tomb: bool,
+        }
+        let rows: Vec<HRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT history_id, id, category, key, COALESCE(workspace_hash, ''), \
+                        COALESCE(recorded_at_unix_ms, created_at_unix_ms), \
+                        invalidated_at_unix_ms, LENGTH(body_json), status \
+                 FROM entity_history WHERE invalidated_at_unix_ms IS NOT NULL \
+                 ORDER BY invalidated_at_unix_ms ASC, \
+                          COALESCE(recorded_at_unix_ms, created_at_unix_ms) ASC",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok(HRow {
+                    history_id: r.get(0)?,
+                    id: r.get(1)?,
+                    cat: r.get(2)?,
+                    key: r.get(3)?,
+                    ws: r.get(4)?,
+                    rec: r.get(5)?,
+                    inv: r.get(6)?,
+                    bytes: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    tomb: r.get::<_, Option<String>>(8)?.as_deref() == Some("compacted"),
+                })
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let n = rows.len();
+        let mut evict = vec![false; n];
+
+        // 1. Age bound.
+        if let Some(days) = policy.max_age_days {
+            let cutoff = now - days.saturating_mul(86_400_000);
+            for (i, r) in rows.iter().enumerate() {
+                if r.inv < cutoff {
+                    evict[i] = true;
+                }
+            }
+        }
+
+        // 2. Per-key version cap. Indices per group stay in global (oldest
+        // first) order because `rows` is sorted.
+        let mut groups: std::collections::HashMap<(String, String, String), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            groups
+                .entry((r.cat.clone(), r.key.clone(), r.ws.clone()))
+                .or_default()
+                .push(i);
+        }
+        if let Some(cap) = policy.max_versions_per_key {
+            let cap = cap.max(0) as usize;
+            for idxs in groups.values() {
+                if idxs.len() > cap {
+                    for &i in &idxs[..idxs.len() - cap] {
+                        evict[i] = true;
+                    }
+                }
+            }
+        }
+
+        // 3. Global byte budget: evict globally-oldest until under budget,
+        // counting what age/cap already evicted toward the reduction.
+        if let Some(budget) = policy.max_bytes {
+            let total: i64 = rows.iter().map(|r| r.bytes).sum();
+            let already: i64 = rows
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| evict[*i])
+                .map(|(_, r)| r.bytes)
+                .sum();
+            let mut kept = total - already;
+            for (i, r) in rows.iter().enumerate() {
+                if kept <= budget {
+                    break;
+                }
+                if !evict[i] {
+                    evict[i] = true;
+                    kept -= r.bytes;
+                }
+            }
+        }
+
+        // Churn guard: re-rolling a lone existing tombstone (no new rows to
+        // fold) would delete + reinsert an equivalent marker. Skip — applied
+        // identically in dry_run so preview matches the real run.
+        for idxs in groups.values() {
+            let ev: Vec<usize> = idxs.iter().copied().filter(|&i| evict[i]).collect();
+            if ev.len() == 1 && rows[ev[0]].tomb {
+                evict[ev[0]] = false;
+            }
+        }
+
+        // Roll up (or just count, in dry_run) per (category, key, workspace).
+        for idxs in groups.values() {
+            let ev: Vec<usize> = idxs.iter().copied().filter(|&i| evict[i]).collect();
+            if ev.is_empty() {
+                continue;
+            }
+            report.keys_affected += 1;
+            report.rows_evicted += ev.len() as i64;
+            report.bytes_evicted += ev.iter().map(|&i| rows[i].bytes).sum::<i64>();
+            if policy.tombstones {
+                report.tombstones_written += 1;
+            }
+            if dry_run {
+                continue;
+            }
+
+            // Fold the evicted run into count + digest. Bodies are fetched
+            // per-row by primary key (only for evicted rows).
+            let mut digest = "genesis".to_string();
+            let mut versions: i64 = 0;
+            let mut first_rec = i64::MAX;
+            let mut last_inv = i64::MIN;
+            for &i in &ev {
+                let r = &rows[i];
+                first_rec = first_rec.min(r.rec);
+                last_inv = last_inv.max(r.inv);
+                let body: String = tx.query_row(
+                    "SELECT body_json FROM entity_history WHERE history_id = ?1",
+                    params![r.history_id],
+                    |q| q.get(0),
+                )?;
+                if r.tomb {
+                    // Merge a prior roll-up: carry its version count forward
+                    // and fold its digest into the chain.
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or_default();
+                    versions += parsed.get("versions").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let prior = parsed
+                        .get("digest")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    digest =
+                        history_retention_digest(&digest, &r.history_id, &prior, r.rec, r.inv);
+                } else {
+                    versions += 1;
+                    digest =
+                        history_retention_digest(&digest, &r.history_id, &body, r.rec, r.inv);
+                }
+                tx.execute(
+                    "DELETE FROM entity_history WHERE history_id = ?1",
+                    params![r.history_id],
+                )?;
+            }
+
+            if policy.tombstones {
+                // One synthetic row spanning the whole evicted prefix. The
+                // surviving rows' windows all start at-or-after last_inv, so
+                // for any T in [first_rec, last_inv) as_of matches exactly
+                // this row. `id` points at the newest evicted version's
+                // lineage for traceability.
+                let newest = &rows[*ev.last().expect("non-empty run")];
+                let history_id = format!(
+                    "hist-tomb-{}",
+                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+                );
+                let body = serde_json::json!({
+                    "compacted": true,
+                    "versions": versions,
+                    "digest": digest,
+                    "first_recorded_at_unix_ms": first_rec,
+                    "last_invalidated_at_unix_ms": last_inv,
+                    "compacted_at_unix_ms": now,
+                })
+                .to_string();
+                tx.execute(
+                    "INSERT INTO entity_history \
+                     (history_id, id, category, key, body_json, status, type, tags, source, \
+                      workspace_hash, valid_from_unix_ms, recorded_at_unix_ms, \
+                      invalidated_at_unix_ms, created_at_unix_ms, last_accessed_unix_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'compacted', 'tombstone', '[]', \
+                             'history_retention', ?6, ?7, ?7, ?8, ?7, ?9)",
+                    params![
+                        history_id,
+                        newest.id,
+                        newest.cat,
+                        newest.key,
+                        body,
+                        newest.ws,
+                        first_rec,
+                        last_inv,
+                        now
+                    ],
+                )?;
+            }
+        }
+
+        if !dry_run {
+            tx.commit()?;
+        }
+        Ok(report)
     }
 
     /// Compact: archive entities below a decay threshold.
@@ -7590,6 +7928,28 @@ fn sha256_chain(prev_hash: &str, event_id: &str, created_at_ms: i64) -> String {
 
 fn sha256_genesis(event_id: &str, created_at_ms: i64) -> String {
     audit_hash("genesis", event_id, created_at_ms)
+}
+
+/// #398: deterministic fold for history-tombstone digests — chained over each
+/// evicted row's (history_id, body, recorded_at, invalidated_at), seeded with
+/// "genesis" (or a merged tombstone's prior digest). Same stdlib DefaultHasher
+/// construction as `audit_hash`: deterministic, NOT cryptographic — upgrade
+/// alongside the audit chain if a crypto crate is adopted.
+fn history_retention_digest(
+    prev: &str,
+    history_id: &str,
+    body_json: &str,
+    recorded_at: i64,
+    invalidated_at: i64,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prev.hash(&mut hasher);
+    history_id.hash(&mut hasher);
+    body_json.hash(&mut hasher);
+    recorded_at.hash(&mut hasher);
+    invalidated_at.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Verify the audit chain by checking that each hash was correctly computed
@@ -15313,6 +15673,480 @@ mod tests {
             lat[lat.len() * 95 / 100],
             lat.len()
         );
+        let _ = fs::remove_file(&path);
+    }
+    // ─── #398: history/journal retention + purge erasure ─────────────────
+
+    /// #398 (headline fix): purge's contract says "the only way to actually
+    /// remove entities" — but it deleted only from `entities`, leaving every
+    /// superseded body readable in entity_history and every journal payload
+    /// referencing the entity intact. A GDPR-style erasure didn't erase.
+    /// After purge: no history rows for the purged ids/key, journal rows
+    /// referencing them are redacted (payloads scrubbed, chain hash intact),
+    /// and as_of inside the fact's past windows returns nothing.
+    #[test]
+    fn purge_erases_history_and_redacts_journal_for_purged_entities() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        // Supersede the key several times so entity_history accumulates rows.
+        db.remember(&make_entity("e-p1", "secrets", "pii", r#"{"note":"v1 SSN 111"}"#))
+            .unwrap();
+        let t_v1: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT recorded_at_unix_ms FROM entities WHERE id='e-p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        sleep(Duration::from_millis(3));
+        db.remember(&make_entity("e-p2", "secrets", "pii", r#"{"note":"v2 SSN 222"}"#))
+            .unwrap();
+        sleep(Duration::from_millis(3));
+        db.remember(&make_entity("e-p3", "secrets", "pii", r#"{"note":"v3 SSN 333"}"#))
+            .unwrap();
+
+        let live_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT id FROM entities WHERE category='secrets' AND key='pii'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let hist_before: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE category='secrets' AND key='pii'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(hist_before >= 2, "supersedes must have written history rows");
+
+        // Journal an event referencing the entity (payload carries the body).
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-p398".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: r#"{"body":"SSN 333"}"#.to_string(),
+            acted_json: r#"{"acted":"stored SSN"}"#.to_string(),
+            forward_json: "{}".to_string(),
+            category: "secrets".to_string(),
+            key: "pii".to_string(),
+            entity_id: live_id.clone(),
+            agent_id: "test".to_string(),
+            created_at_unix_ms: now_ms(),
+        })
+        .unwrap();
+        // A second, unrelated event AFTER it, so the chain continues past the
+        // row purge will redact — redaction must not break verification.
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-p398-after".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "other".to_string(),
+            key: "unrelated".to_string(),
+            entity_id: String::new(),
+            agent_id: "test".to_string(),
+            created_at_unix_ms: now_ms() + 1,
+        })
+        .unwrap();
+
+        // Erase: forget (archive) then purge — the documented erasure path.
+        assert!(db.forget("secrets", "pii", "gdpr erasure").unwrap());
+        // dry_run previews the side-table impact with the same predicates.
+        let dry = db.purge(true).unwrap();
+        assert!(dry.dry_run);
+        let report = db.purge(false).unwrap();
+        assert_eq!(report.entities_deleted, 1);
+        assert_eq!(dry.entities_deleted, report.entities_deleted);
+        assert_eq!(dry.history_rows_deleted, report.history_rows_deleted);
+        assert_eq!(dry.journal_rows_redacted, report.journal_rows_redacted);
+
+        let conn = db.conn().unwrap();
+        // 1. NOTHING for the key remains in entity_history.
+        let hist_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE category='secrets' AND key='pii'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hist_after, 0,
+            "purge must erase entity_history for purged entities (pre-#398 it left {} rows)",
+            hist_before
+        );
+        assert!(report.history_rows_deleted >= hist_before);
+
+        // 2. Journal rows referencing the entity are redacted: payloads and
+        //    identifying fields scrubbed, row (id, audit_hash, created_at) kept.
+        let (etype, eval, acted, cat, key, eid): (String, String, String, String, String, String) =
+            conn.query_row(
+                "SELECT event_type, evaluated_json, acted_json, category, key, entity_id \
+                 FROM journal WHERE id='jrn-p398'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(etype, "redacted", "purged journal rows must be marked redacted");
+        assert!(
+            !eval.contains("SSN") && !acted.contains("SSN"),
+            "journal payloads must not retain purged bodies (got {eval} / {acted})"
+        );
+        assert_eq!(cat, "", "category scrubbed");
+        assert_eq!(key, "", "key scrubbed");
+        assert_eq!(eid, "", "entity_id scrubbed");
+        assert!(report.journal_rows_redacted >= 1);
+
+        // 3. The audit chain still verifies end-to-end: redaction preserves
+        //    the hashed fields (id, created_at, audit_hash).
+        drop(conn);
+        verify_audit_chain(&db).expect("audit chain must survive purge redaction");
+
+        // 4. Time-travel inside the erased fact's past windows finds nothing.
+        assert!(
+            db.as_of("secrets", "pii", t_v1 + 1).unwrap().is_none(),
+            "as_of must not resurrect an erased fact"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    fn retention_policy(
+        age: Option<i64>,
+        cap: Option<i64>,
+        bytes: Option<i64>,
+        tombstones: bool,
+    ) -> crate::models::HistoryRetentionPolicy {
+        crate::models::HistoryRetentionPolicy {
+            max_age_days: age,
+            max_versions_per_key: cap,
+            max_bytes: bytes,
+            tombstones,
+        }
+    }
+
+    /// Write `n` distinct versions of facts/versioned-key, 3ms apart, and
+    /// return the first version's recorded_at. n remembers → n-1 history rows.
+    fn seed_versions(db: &Database, n: usize) -> i64 {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let mut t_first = 0i64;
+        for i in 0..n {
+            db.remember(&make_entity(
+                &format!("e-ret-{i}"),
+                "facts",
+                "versioned-key",
+                &format!(r#"{{"note":"version {i} with some padding body text"}}"#),
+            ))
+            .unwrap();
+            if i == 0 {
+                let conn = db.conn().unwrap();
+                t_first = conn
+                    .query_row(
+                        "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms) \
+                         FROM entities WHERE category='facts' AND key='versioned-key'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+            }
+            sleep(Duration::from_millis(3));
+        }
+        t_first
+    }
+
+    fn history_count(db: &Database) -> i64 {
+        let conn = db.conn().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM entity_history", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// #398: default policy (no knobs) must be a guaranteed no-op — today's
+    /// keep-everything behavior is preserved unless an operator opts in.
+    #[test]
+    fn history_retention_is_a_noop_with_no_knobs_set() {
+        let (db, path) = temp_db();
+        seed_versions(&db, 4);
+        let before = history_count(&db);
+        assert_eq!(before, 3);
+        let report = db
+            .enforce_history_retention(&retention_policy(None, None, None, true), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 0);
+        assert_eq!(history_count(&db), before, "unlimited policy must not touch history");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: per-key version cap evicts the oldest run, replaces it with ONE
+    /// tombstone, and as_of inside the compacted window returns the explicit
+    /// 'compacted' marker instead of silence or wrong data. Instants covered
+    /// by surviving rows are answered exactly as before.
+    #[test]
+    fn history_retention_version_cap_writes_tombstone_and_as_of_marks_it() {
+        let (db, path) = temp_db();
+        let t_first = seed_versions(&db, 6); // 5 history rows
+        assert_eq!(history_count(&db), 5);
+
+        let report = db
+            .enforce_history_retention(&retention_policy(None, Some(2), None, true), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 3, "5 stored - cap 2 = 3 evicted");
+        assert_eq!(report.tombstones_written, 1);
+        assert_eq!(report.keys_affected, 1);
+        assert_eq!(history_count(&db), 3, "2 survivors + 1 tombstone");
+
+        // The tombstone carries count + digest and spans the evicted windows.
+        let conn = db.conn().unwrap();
+        let (status, body): (String, String) = conn
+            .query_row(
+                "SELECT status, body_json FROM entity_history WHERE status='compacted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "compacted");
+        let marker: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(marker["compacted"], serde_json::json!(true));
+        assert_eq!(marker["versions"], serde_json::json!(3));
+        assert!(marker["digest"].as_str().unwrap().len() == 16);
+        drop(conn);
+
+        // as_of inside the compacted window → explicit marker.
+        let inside = db
+            .as_of("facts", "versioned-key", t_first)
+            .unwrap()
+            .expect("compacted window must still answer, with a marker");
+        assert_eq!(inside.status, "compacted");
+        assert!(inside.body_json.contains("\"versions\":3"));
+
+        // as_of inside a SURVIVING window → the real old version, unchanged.
+        let conn = db.conn().unwrap();
+        let (surv_rec,): (i64,) = conn
+            .query_row(
+                "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms) FROM entity_history \
+                 WHERE status != 'compacted' ORDER BY invalidated_at_unix_ms DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        drop(conn);
+        let survivor = db
+            .as_of("facts", "versioned-key", surv_rec)
+            .unwrap()
+            .expect("surviving window must answer normally");
+        assert_ne!(survivor.status, "compacted");
+        assert!(survivor.body_json.contains("version 4"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: age bound evicts only rows invalidated before the cutoff.
+    #[test]
+    fn history_retention_age_bound_evicts_only_old_rows() {
+        let (db, path) = temp_db();
+        seed_versions(&db, 5); // 4 history rows
+        // Back-date the 2 oldest versions by 3 days.
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entity_history SET \
+                     invalidated_at_unix_ms = invalidated_at_unix_ms - 259200000, \
+                     recorded_at_unix_ms = COALESCE(recorded_at_unix_ms, created_at_unix_ms) - 259200000, \
+                     created_at_unix_ms = created_at_unix_ms - 259200000 \
+                 WHERE history_id IN (SELECT history_id FROM entity_history \
+                                      ORDER BY invalidated_at_unix_ms ASC LIMIT 2)",
+                [],
+            )
+            .unwrap();
+        }
+        let report = db
+            .enforce_history_retention(&retention_policy(Some(1), None, None, true), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 2, "only the back-dated rows age out");
+        assert_eq!(report.tombstones_written, 1);
+        assert_eq!(history_count(&db), 3, "2 fresh survivors + 1 tombstone");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: global byte budget evicts globally-oldest until under budget.
+    #[test]
+    fn history_retention_byte_budget_evicts_globally_oldest_first() {
+        let (db, path) = temp_db();
+        seed_versions(&db, 5); // 4 history rows, equal-sized bodies
+        let conn = db.conn().unwrap();
+        let (total, per_row, oldest_id): (i64, i64, String) = conn
+            .query_row(
+                "SELECT SUM(LENGTH(body_json)), MAX(LENGTH(body_json)), \
+                        (SELECT history_id FROM entity_history ORDER BY invalidated_at_unix_ms ASC LIMIT 1) \
+                 FROM entity_history",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        drop(conn);
+        // Budget that forces exactly one eviction (equal-sized rows).
+        let budget = total - 1;
+        let report = db
+            .enforce_history_retention(&retention_policy(None, None, Some(budget), true), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 1, "one row over budget → one eviction");
+        assert!(report.bytes_evicted >= per_row - 2 && report.bytes_evicted <= per_row);
+        let conn = db.conn().unwrap();
+        let gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE history_id = ?1",
+                params![oldest_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "the globally-oldest row must be the one evicted");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: dry_run computes the identical eviction set — counts match the
+    /// subsequent real run exactly, and nothing is mutated.
+    #[test]
+    fn history_retention_dry_run_counts_match_actual_run() {
+        let (db, path) = temp_db();
+        seed_versions(&db, 6); // 5 history rows
+        let policy = retention_policy(None, Some(2), None, true);
+
+        let before = history_count(&db);
+        let dry = db.enforce_history_retention(&policy, true).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(history_count(&db), before, "dry_run must not mutate");
+
+        let actual = db.enforce_history_retention(&policy, false).unwrap();
+        assert_eq!(dry.rows_evicted, actual.rows_evicted);
+        assert_eq!(dry.bytes_evicted, actual.bytes_evicted);
+        assert_eq!(dry.tombstones_written, actual.tombstones_written);
+        assert_eq!(dry.keys_affected, actual.keys_affected);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: a later pass folds the existing tombstone into the new one —
+    /// version counts accumulate and exactly one tombstone remains per key.
+    #[test]
+    fn history_retention_second_pass_merges_prior_tombstone() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+        seed_versions(&db, 6); // h1..h5
+        let policy = retention_policy(None, Some(2), None, true);
+        db.enforce_history_retention(&policy, false).unwrap(); // tomb(3) + h4,h5
+
+        let conn = db.conn().unwrap();
+        let first_digest: String = conn
+            .query_row(
+                "SELECT body_json FROM entity_history WHERE status='compacted'",
+                [],
+                |r| r.get(0),
+            )
+            .map(|b: String| {
+                serde_json::from_str::<serde_json::Value>(&b).unwrap()["digest"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap();
+        drop(conn);
+
+        // Three more versions, then enforce again.
+        for i in 0..3 {
+            sleep(Duration::from_millis(3));
+            db.remember(&make_entity(
+                &format!("e-ret2-{i}"),
+                "facts",
+                "versioned-key",
+                &format!(r#"{{"note":"second wave {i}"}}"#),
+            ))
+            .unwrap();
+        }
+        // rows now: tomb(3), h4, h5, h6 (+2 newest) = 6 → cap 2 evicts 4.
+        let report = db.enforce_history_retention(&policy, false).unwrap();
+        assert_eq!(report.rows_evicted, 4);
+
+        let conn = db.conn().unwrap();
+        let tombs: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT body_json FROM entity_history WHERE status='compacted'")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(tombs.len(), 1, "successive passes keep ONE tombstone per key");
+        let marker: serde_json::Value = serde_json::from_str(&tombs[0]).unwrap();
+        assert_eq!(
+            marker["versions"],
+            serde_json::json!(6),
+            "merged tombstone must carry 3 (prior roll-up) + 3 (new) versions"
+        );
+        assert_ne!(marker["digest"].as_str().unwrap(), first_digest);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: with tombstones disabled the evicted prefix is hard-deleted and
+    /// as_of inside the window finds nothing (the degenerate option-1 mode).
+    #[test]
+    fn history_retention_hard_delete_when_tombstones_disabled() {
+        let (db, path) = temp_db();
+        let t_first = seed_versions(&db, 3); // 2 history rows
+        let report = db
+            .enforce_history_retention(&retention_policy(None, Some(1), None, false), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 1);
+        assert_eq!(report.tombstones_written, 0);
+        assert_eq!(history_count(&db), 1, "hard delete: no tombstone row");
+        assert!(
+            db.as_of("facts", "versioned-key", t_first).unwrap().is_none(),
+            "hard-deleted window answers nothing"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: mimir_stats surfaces history growth — rows, stored bytes, and
+    /// the hot keys by version count.
+    #[test]
+    fn stats_report_history_rows_bytes_and_top_keys() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+        seed_versions(&db, 4); // 3 history rows for facts/versioned-key
+        db.remember(&make_entity("e-oth-1", "facts", "other-key", r#"{"n":1}"#))
+            .unwrap();
+        sleep(Duration::from_millis(3));
+        db.remember(&make_entity("e-oth-2", "facts", "other-key", r#"{"n":2}"#))
+            .unwrap(); // 1 history row
+
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.total_history_rows, 4);
+        assert!(stats.history_bytes > 0);
+        let top = stats.top_history_keys.as_array().unwrap();
+        assert_eq!(top[0]["key"], serde_json::json!("versioned-key"));
+        assert_eq!(top[0]["versions"], serde_json::json!(3));
+        assert!(top[0]["bytes"].as_i64().unwrap() > 0);
         let _ = fs::remove_file(&path);
     }
 }

@@ -754,7 +754,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_as_of",
-    "description": "Transaction-time time-travel: return the version of a fact (category + key) that Mneme believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. For the orthogonal valid-time axis ('what was actually TRUE in the world at time T') use mimir_valid_at; for both axes at once use mimir_bitemporal. Returns found=false if the fact had not been recorded yet at that time.",
+    "description": "Transaction-time time-travel: return the version of a fact (category + key) that Mneme believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. For the orthogonal valid-time axis ('what was actually TRUE in the world at time T') use mimir_valid_at; for both axes at once use mimir_bitemporal. Returns found=false if the fact had not been recorded yet at that time. If the instant falls inside a window compacted by history retention (#398), returns an explicit marker (compacted=true, versions_compacted, digest) instead of the original — now unrecoverable — versions.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -805,6 +805,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "as_of_unix_ms": {
           "type": "integer"
+        },
+        "compacted": {
+          "type": "boolean",
+          "description": "Present and true when the instant falls inside a retention-compacted window: the result is a tombstone marker, not a real version (#398)"
+        },
+        "versions_compacted": {
+          "type": "integer",
+          "description": "How many original versions the compacted window rolled up (#398)"
+        },
+        "digest": {
+          "type": "string",
+          "description": "Hash-chain digest folded over the evicted versions (#398)"
         }
       }
     },
@@ -1171,7 +1183,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_prune",
-    "description": "Bulk archive entities by category, decay threshold, or age. Use dry_run=true to preview without archiving. Useful for cleaning stale or low-quality memories.",
+    "description": "Bulk archive entities by category, decay threshold, or age. Use dry_run=true to preview without archiving. Useful for cleaning stale or low-quality memories. With scope='history' (#398) it instead evicts old superseded versions from entity_history under the given (or env-configured MIMIR_HISTORY_*) bounds, rolling each evicted run into a compaction tombstone; dry_run reports the rows and bytes that would be evicted.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1192,10 +1204,27 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "default": 100,
           "description": "Max entities to prune (0 = unlimited)"
         },
+        "scope": {
+          "type": "string",
+          "enum": ["entities", "history"],
+          "description": "'history' prunes superseded versions from entity_history under retention bounds instead of archiving live entities (#398)"
+        },
+        "max_age_days": {
+          "type": "integer",
+          "description": "scope='history': evict versions invalidated more than this many days ago (overrides MIMIR_HISTORY_MAX_AGE_DAYS)"
+        },
+        "max_versions_per_key": {
+          "type": "integer",
+          "description": "scope='history': keep at most this many stored versions per key, oldest evicted first (overrides MIMIR_HISTORY_MAX_VERSIONS_PER_KEY)"
+        },
+        "max_bytes": {
+          "type": "integer",
+          "description": "scope='history': global stored-history byte budget, globally-oldest evicted first (overrides MIMIR_HISTORY_MAX_BYTES)"
+        },
         "dry_run": {
           "type": "boolean",
           "default": false,
-          "description": "Preview without archiving"
+          "description": "Preview without archiving/evicting"
         }
       }
     },
@@ -1633,7 +1662,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_stats",
-    "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; and date range of stored data.",
+    "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; date range of stored data; and history growth (stored version rows, bytes, and the top-10 keys by version count — #398).",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1676,6 +1705,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "newest_unix_ms": {
           "type": "integer",
           "description": "Newest entity creation timestamp"
+        },
+        "total_history_rows": {
+          "type": "integer",
+          "description": "Superseded versions stored in entity_history, incl. compaction tombstones (#398)"
+        },
+        "history_bytes": {
+          "type": "integer",
+          "description": "Stored history body bytes — SUM(LENGTH(body_json)); row/index overhead excluded (#398)"
+        },
+        "top_history_keys": {
+          "type": "array",
+          "description": "Top-10 (category, key) pairs by stored version count: [{category, key, versions, bytes}] (#398)"
         }
       }
     },
@@ -1731,7 +1772,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_purge",
-    "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities — prune/forget only soft-archive. Archived entities are DELETED and NOT RECOVERABLE. Supports dry_run=true to preview first.",
+    "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities — prune/forget only soft-archive. Erasure is complete (#398): every superseded version of a purged entity is deleted from entity_history, and journal rows referencing it are redacted in place (payloads scrubbed; rows kept so the audit hash chain stays verifiable). Purged data is DELETED and NOT RECOVERABLE — this forget-then-purge path is the GDPR-style erasure mechanism. Supports dry_run=true to preview first.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1749,6 +1790,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "entities_deleted": {
           "type": "integer",
           "description": "Number of archived entities permanently deleted"
+        },
+        "history_rows_deleted": {
+          "type": "integer",
+          "description": "Superseded versions of the purged entities deleted from entity_history (#398)"
+        },
+        "journal_rows_redacted": {
+          "type": "integer",
+          "description": "Journal rows referencing purged entities scrubbed in place; the audit hash chain stays valid (#398)"
         },
         "bytes_freed": {
           "type": "integer",
@@ -3055,7 +3104,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_autocohere",
-    "description": "Run a full atomic grooming pass: cohere (promote, link, archive), then decay (recalculate Ebbinghaus decay), then compact (archive below threshold). Returns a summary report. Use dry_run=true to preview without changes.",
+    "description": "Run a full atomic grooming pass: cohere (promote, link, archive), then decay (recalculate Ebbinghaus decay), then compact (archive below threshold), then consolidate, then enforce the entity_history retention policy (#398 — no-op unless MIMIR_HISTORY_* env knobs are set). Returns a summary report. Use dry_run=true to preview without changes.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3088,6 +3137,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "compact_archived_count": {
           "type": "integer",
           "description": "Entities archived during compact step"
+        },
+        "history_rows_evicted": {
+          "type": "integer",
+          "description": "entity_history rows evicted by the retention policy (#398; 0 while no MIMIR_HISTORY_* knob is set)"
+        },
+        "history_bytes_evicted": {
+          "type": "integer",
+          "description": "Stored history body bytes evicted (#398)"
+        },
+        "history_tombstones_written": {
+          "type": "integer",
+          "description": "Compaction tombstones written (#398)"
         },
         "db_size_delta_bytes": {
           "type": "integer",
@@ -3190,7 +3251,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_maintenance",
-    "description": "Database maintenance operations: deduplicate entities with identical (category, key), detect orphan journal entries and links, vacuum (reclaim disk space), reindex FTS5. Set dry_run=true to preview. Use 'all' to run everything.",
+    "description": "Database maintenance operations: deduplicate entities with identical (category, key), detect orphan journal entries and links, vacuum (reclaim disk space), reindex FTS5, and enforce the entity_history retention policy (#398 — no-op unless MIMIR_HISTORY_* env knobs are set). Set dry_run=true to preview. Use 'all' to run everything.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3214,9 +3275,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "description": "Rebuild the FTS5 search index from entities table",
           "default": false
         },
+        "history": {
+          "type": "boolean",
+          "description": "Enforce the entity_history retention policy from MIMIR_HISTORY_* env knobs (#398; no-op while none are set)",
+          "default": false
+        },
         "all": {
           "type": "boolean",
-          "description": "Run all maintenance operations (dedup, orphans, vacuum, reindex)",
+          "description": "Run all maintenance operations (dedup, orphans, vacuum, reindex, history retention)",
           "default": false
         },
         "dry_run": {
@@ -3248,6 +3314,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "reindex_rows_affected": {
           "type": "integer",
           "description": "Rows reindexed into FTS5"
+        },
+        "history_rows_evicted": {
+          "type": "integer",
+          "description": "entity_history rows evicted by the retention policy (#398)"
+        },
+        "history_bytes_evicted": {
+          "type": "integer",
+          "description": "Stored history body bytes evicted (#398)"
+        },
+        "history_tombstones_written": {
+          "type": "integer",
+          "description": "Compaction tombstones written for evicted runs (#398)"
         },
         "dry_run": {
           "type": "boolean"

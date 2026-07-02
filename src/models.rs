@@ -464,9 +464,111 @@ pub struct CompactReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct PurgeReport {
     pub entities_deleted: i64,
+    /// #398: superseded versions of the purged entities removed from
+    /// entity_history — purge's "actually remove" contract now covers history.
+    pub history_rows_deleted: i64,
+    /// #398: journal rows referencing the purged entities whose payloads were
+    /// scrubbed in place (rows are kept so the audit hash chain stays valid).
+    pub journal_rows_redacted: i64,
     pub bytes_freed: i64,
     pub dry_run: bool,
     pub completed_at_unix_ms: i64,
+}
+
+/// #398: entity_history retention knobs. Every knob defaults OFF (None =
+/// unlimited), preserving the pre-#398 keep-everything behavior — enabling a
+/// bound is a deliberate operator decision, made via env:
+///   * `MIMIR_HISTORY_MAX_AGE_DAYS` — evict versions invalidated more than N
+///     days ago.
+///   * `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY` — keep at most N stored versions
+///     per (category, key, workspace); oldest evicted first. Hot state-like
+///     keys are the pathological case (10k supersedes of one key = +14.5MB).
+///   * `MIMIR_HISTORY_MAX_BYTES` — global budget over stored history body
+///     bytes; globally-oldest versions evicted until under budget.
+///   * `MIMIR_HISTORY_TOMBSTONES` — default ON: an evicted run is replaced by
+///     one synthetic tombstone row (see Database::enforce_history_retention)
+///     so time-travel inside the window answers "compacted", not silence.
+///     Set to `0`/`false` for hard delete (the degenerate mode).
+/// Enforcement runs only in maintenance paths (mimir_maintenance --all,
+/// mimir_autocohere, mimir_prune scope=history) — never on the write path.
+#[derive(Debug, Clone)]
+pub struct HistoryRetentionPolicy {
+    pub max_age_days: Option<i64>,
+    pub max_versions_per_key: Option<i64>,
+    pub max_bytes: Option<i64>,
+    pub tombstones: bool,
+}
+
+impl Default for HistoryRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_age_days: None,
+            max_versions_per_key: None,
+            max_bytes: None,
+            tombstones: true,
+        }
+    }
+}
+
+impl HistoryRetentionPolicy {
+    /// Read the policy from the environment. Unset / non-numeric / <= 0
+    /// values leave a knob OFF.
+    pub fn from_env() -> Self {
+        fn env_pos(name: &str) -> Option<i64> {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|v| *v > 0)
+        }
+        let tombstones = !matches!(
+            std::env::var("MIMIR_HISTORY_TOMBSTONES")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "off" | "no"
+        );
+        Self {
+            max_age_days: env_pos("MIMIR_HISTORY_MAX_AGE_DAYS"),
+            max_versions_per_key: env_pos("MIMIR_HISTORY_MAX_VERSIONS_PER_KEY"),
+            max_bytes: env_pos("MIMIR_HISTORY_MAX_BYTES"),
+            tombstones,
+        }
+    }
+
+    /// True when no bound is configured — enforcement is a no-op.
+    pub fn is_unlimited(&self) -> bool {
+        self.max_age_days.is_none()
+            && self.max_versions_per_key.is_none()
+            && self.max_bytes.is_none()
+    }
+
+    /// Echo for reports.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_age_days": self.max_age_days,
+            "max_versions_per_key": self.max_versions_per_key,
+            "max_bytes": self.max_bytes,
+            "tombstones": self.tombstones,
+        })
+    }
+}
+
+/// Report from a history-retention enforcement pass (#398).
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryRetentionReport {
+    /// History rows removed (or, in dry_run, that WOULD be removed).
+    pub rows_evicted: i64,
+    /// Stored body bytes of the evicted rows (LENGTH(body_json); row/index
+    /// overhead excluded).
+    pub bytes_evicted: i64,
+    /// Tombstone roll-up rows written (0 when tombstones are disabled).
+    pub tombstones_written: i64,
+    /// Distinct (category, key, workspace) groups touched.
+    pub keys_affected: i64,
+    pub dry_run: bool,
+    /// The policy that was enforced.
+    pub policy: serde_json::Value,
 }
 
 /// Parameters for the coherence daemon pass.
@@ -550,6 +652,14 @@ pub struct Stats {
     /// Partition modularity of the most recent community-detection run
     /// (None until `mimir_communities` has run at least once).
     pub graph_modularity: Option<f64>,
+    /// #398: superseded versions stored in entity_history (incl. tombstones).
+    pub total_history_rows: i64,
+    /// #398: stored history body bytes (SUM(LENGTH(body_json)); row/index
+    /// overhead excluded). The growth signal retention knobs bound.
+    pub history_bytes: i64,
+    /// #398: top-10 (category, key) pairs by stored version count —
+    /// `[{category, key, versions, bytes}]` — the hot keys to cap first.
+    pub top_history_keys: serde_json::Value,
 }
 
 /// Graph node for entity link visualization.

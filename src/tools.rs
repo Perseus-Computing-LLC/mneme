@@ -924,16 +924,35 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
         .map_err(|e| format!("as_of failed: {}", e))?;
 
     let result = match found {
-        Some(e) => json!({
-            "found": true,
-            "id": e.id,
-            "category": e.category,
-            "key": e.key,
-            "body_json": e.body_json,
-            "status": e.status,
-            "entity_type": e.entity_type,
-            "as_of_unix_ms": as_of,
-        }),
+        Some(e) => {
+            let mut r = json!({
+                "found": true,
+                "id": e.id,
+                "category": e.category,
+                "key": e.key,
+                "body_json": e.body_json,
+                "status": e.status,
+                "entity_type": e.entity_type,
+                "as_of_unix_ms": as_of,
+            });
+            // #398: the instant falls inside a retention-compacted window —
+            // surface an explicit marker (version count + roll-up digest from
+            // the tombstone body) instead of letting the synthetic row pass
+            // for a real version.
+            if e.status == "compacted" {
+                let marker: serde_json::Value =
+                    serde_json::from_str(&e.body_json).unwrap_or_default();
+                r["compacted"] = json!(true);
+                r["versions_compacted"] =
+                    marker.get("versions").cloned().unwrap_or(json!(null));
+                r["digest"] = marker.get("digest").cloned().unwrap_or(json!(null));
+                r["note"] = json!(
+                    "history inside this window was compacted by retention policy; \
+                     the original versions are not recoverable"
+                );
+            }
+            r
+        }
         None => json!({
             "found": false,
             "category": category,
@@ -1903,6 +1922,42 @@ pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
+    // #398: scope='history' targets entity_history instead of live entities —
+    // enforce the retention policy (env knobs, overridable per-call). With
+    // dry_run=true this reports the rows + bytes that WOULD be evicted.
+    if args.get("scope").and_then(|v| v.as_str()) == Some("history") {
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut policy = crate::models::HistoryRetentionPolicy::from_env();
+        if let Some(v) = args.get("max_age_days").and_then(|v| v.as_i64()).filter(|v| *v > 0) {
+            policy.max_age_days = Some(v);
+        }
+        if let Some(v) = args
+            .get("max_versions_per_key")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+        {
+            policy.max_versions_per_key = Some(v);
+        }
+        if let Some(v) = args.get("max_bytes").and_then(|v| v.as_i64()).filter(|v| *v > 0) {
+            policy.max_bytes = Some(v);
+        }
+        if policy.is_unlimited() {
+            return Err(
+                "prune scope='history' requires a bound: pass max_age_days, \
+                 max_versions_per_key, or max_bytes (or set the MIMIR_HISTORY_* env knobs)"
+                    .to_string(),
+            );
+        }
+        let report = db
+            .enforce_history_retention(&policy, dry_run)
+            .map_err(|e| format!("History prune failed: {}", e))?;
+        return serde_json::to_string(&report)
+            .map_err(|e| format!("Serialization failed: {}", e));
+    }
+
     let params: PruneParams =
         serde_json::from_value(args).map_err(|e| format!("Invalid prune arguments: {}", e))?;
 
@@ -2153,6 +2208,14 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
         consolidate_sources_archived += report.sources_archived;
     }
 
+    // 5. History retention (#398): enforce the env-configured budget over
+    // entity_history in the same background pass. With no MIMIR_HISTORY_*
+    // knob set this is a guaranteed no-op, so autocohere's default behavior
+    // is unchanged.
+    let retention_report = db
+        .enforce_history_retention(&crate::models::HistoryRetentionPolicy::from_env(), a.dry_run)
+        .map_err(|e| format!("Autocohere step (history retention) failed: {}", e))?;
+
     let final_db_size = if a.dry_run {
         initial_db_size
     } else {
@@ -2168,6 +2231,9 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
         "compact_archived_count": compact_report.entities_archived,
         "observations_created": observations_created,
         "consolidate_sources_archived": consolidate_sources_archived,
+        "history_rows_evicted": retention_report.rows_evicted,
+        "history_bytes_evicted": retention_report.bytes_evicted,
+        "history_tombstones_written": retention_report.tombstones_written,
         "db_size_delta_bytes": final_db_size as i64 - initial_db_size as i64,
         "dry_run": a.dry_run,
     });
@@ -2325,6 +2391,10 @@ pub struct MaintenanceArgs {
     pub vacuum: bool,
     #[serde(default)]
     pub reindex: bool,
+    /// #398: enforce the entity_history retention policy (env knobs; no-op
+    /// while no knob is set). Included in `all`.
+    #[serde(default)]
+    pub history: bool,
     #[serde(default)]
     pub all: bool,
     #[serde(default)]
@@ -2341,6 +2411,9 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
         "orphan_links_found": 0,
         "vacuum_reclaimed_bytes": 0,
         "reindex_rows_affected": 0,
+        "history_rows_evicted": 0,
+        "history_bytes_evicted": 0,
+        "history_tombstones_written": 0,
         "dry_run": a.dry_run,
         "errors": []
     });
@@ -2410,6 +2483,25 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
                 .as_array_mut()
                 .unwrap()
                 .push(json!(format!("Reindex failed: {}", e))),
+        }
+    }
+
+    // History retention (#398): enforce the env-configured budget over
+    // entity_history. A no-op (zero rows) while no MIMIR_HISTORY_* knob is
+    // set — the default stays "keep everything". dry_run reports what would
+    // be evicted.
+    if a.history || a.all {
+        let policy = crate::models::HistoryRetentionPolicy::from_env();
+        match db.enforce_history_retention(&policy, a.dry_run) {
+            Ok(r) => {
+                report["history_rows_evicted"] = json!(r.rows_evicted);
+                report["history_bytes_evicted"] = json!(r.bytes_evicted);
+                report["history_tombstones_written"] = json!(r.tombstones_written);
+            }
+            Err(e) => report["errors"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!("History retention failed: {}", e))),
         }
     }
 
@@ -4340,6 +4432,124 @@ mod tests {
         let lv: Value = serde_json::from_str(&legacy).unwrap();
         assert_eq!(lv["mode"], "always_inject");
         assert_eq!(lv["budget_chars"], 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── History retention hooks (#398) ──────────────────────────
+
+    /// #398: mimir_prune scope='history' enforces retention with dry_run
+    /// preview (count + bytes that WOULD be evicted) matching the real run,
+    /// and requires an explicit bound.
+    #[test]
+    fn prune_history_scope_dry_run_then_evicts_with_tombstone() {
+        let (db, path) = temp_db();
+        for i in 0..6 {
+            handle_remember(
+                &db,
+                json!({"category": "facts", "key": "hot398",
+                       "body_json": format!("{{\"content\":\"v{i}\"}}")}),
+            )
+            .expect("remember");
+        }
+        // 5 stored versions. No bound → explicit error, not a silent no-op.
+        let err = handle_prune(&db, json!({"scope": "history"})).unwrap_err();
+        assert!(err.contains("requires a bound"), "got: {err}");
+
+        let dry = handle_prune(
+            &db,
+            json!({"scope": "history", "max_versions_per_key": 2, "dry_run": true}),
+        )
+        .expect("dry run");
+        let dv: Value = serde_json::from_str(&dry).unwrap();
+        assert_eq!(dv["rows_evicted"].as_i64().unwrap(), 3);
+        assert!(dv["bytes_evicted"].as_i64().unwrap() > 0);
+        assert_eq!(dv["dry_run"], json!(true));
+        assert_eq!(
+            db.history_versions("facts", "hot398").unwrap().len(),
+            5,
+            "dry_run must not evict"
+        );
+
+        let real = handle_prune(
+            &db,
+            json!({"scope": "history", "max_versions_per_key": 2}),
+        )
+        .expect("real run");
+        let rv: Value = serde_json::from_str(&real).unwrap();
+        assert_eq!(rv["rows_evicted"], dv["rows_evicted"], "preview must match actual");
+        assert_eq!(rv["bytes_evicted"], dv["bytes_evicted"]);
+        assert_eq!(rv["tombstones_written"].as_i64().unwrap(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #398: the as_of MCP tool surfaces the tombstone as an explicit
+    /// compacted marker (flag + version count + digest), not a fake version.
+    #[test]
+    fn as_of_tool_surfaces_compacted_marker() {
+        let (db, path) = temp_db();
+        for i in 0..4 {
+            handle_remember(
+                &db,
+                json!({"category": "facts", "key": "hot398b",
+                       "body_json": format!("{{\"content\":\"v{i}\"}}")}),
+            )
+            .expect("remember");
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        let t_first: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT MIN(COALESCE(recorded_at_unix_ms, created_at_unix_ms)) \
+                 FROM entity_history WHERE key='hot398b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        handle_prune(
+            &db,
+            json!({"scope": "history", "max_versions_per_key": 1}),
+        )
+        .expect("evict");
+
+        let resp = handle_as_of(
+            &db,
+            json!({"category": "facts", "key": "hot398b", "as_of_unix_ms": t_first}),
+        )
+        .expect("as_of");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["found"], json!(true));
+        assert_eq!(v["compacted"], json!(true), "marker must be explicit: {resp}");
+        assert_eq!(v["status"], json!("compacted"));
+        assert_eq!(v["versions_compacted"].as_i64().unwrap(), 2);
+        assert_eq!(v["digest"].as_str().unwrap().len(), 16);
+        assert!(v["note"].as_str().unwrap().contains("not recoverable"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #398: maintenance runs retention only via the env policy — with no
+    /// knobs set it reports zero evictions (default-off contract), and the
+    /// report always carries the history fields.
+    #[test]
+    fn maintenance_history_step_is_noop_without_env_knobs() {
+        let (db, path) = temp_db();
+        for i in 0..4 {
+            handle_remember(
+                &db,
+                json!({"category": "facts", "key": "hot398c",
+                       "body_json": format!("{{\"content\":\"v{i}\"}}")}),
+            )
+            .expect("remember");
+        }
+        let resp = handle_maintenance(&db, json!({"history": true})).expect("maintenance");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["history_rows_evicted"].as_i64().unwrap(), 0);
+        assert_eq!(v["history_tombstones_written"].as_i64().unwrap(), 0);
+        assert_eq!(
+            db.history_versions("facts", "hot398c").unwrap().len(),
+            3,
+            "no env knobs → maintenance must keep every version"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

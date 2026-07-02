@@ -610,6 +610,37 @@ pub fn gather_stats(conn: &Connection, db_path: &str) -> Result<Stats, Box<dyn s
         )
         .ok();
 
+    // History growth visibility (#398): entity_history is append-only unless
+    // retention/purge trims it, so surface size + the hot keys directly in
+    // stats — rows, stored body bytes, and the top-10 keys by version count.
+    let (total_history_rows, history_bytes): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(body_json)), 0) FROM entity_history",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let top_history_keys: serde_json::Value = {
+        let mut items = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT category, key, COUNT(*) AS versions, COALESCE(SUM(LENGTH(body_json)), 0) \
+             FROM entity_history GROUP BY category, key \
+             ORDER BY versions DESC, category ASC, key ASC LIMIT 10",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok(json!({
+                    "category": r.get::<_, String>(0)?,
+                    "key": r.get::<_, String>(1)?,
+                    "versions": r.get::<_, i64>(2)?,
+                    "bytes": r.get::<_, i64>(3)?,
+                }))
+            }) {
+                items.extend(rows.flatten());
+            }
+        }
+        serde_json::Value::Array(items)
+    };
+
     Ok(Stats {
         total_entities,
         by_category,
@@ -622,6 +653,9 @@ pub fn gather_stats(conn: &Connection, db_path: &str) -> Result<Stats, Box<dyn s
         newest_unix_ms: newest,
         total_communities,
         graph_modularity,
+        total_history_rows,
+        history_bytes,
+        top_history_keys,
     })
 }
 

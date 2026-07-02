@@ -21,6 +21,10 @@ remember ──▶ active (buffer) ──▶ working ──▶ core        promo
 
 Nothing is ever deleted automatically. Automatic forgetting stops at
 **archived**, which is reversible; only an explicit `purge` deletes rows.
+(One opt-in exception: superseded *versions* in `entity_history` can be
+evicted by the history retention knobs — see
+[Version history retention](#version-history-retention-398). All knobs
+default OFF.)
 
 ## Decay: forgetting by disuse
 
@@ -103,6 +107,52 @@ Deletion is explicit and two-step:
   (category, `decay_score` below a cutoff, older than N days).
 - **`purge`** — permanently delete entities that are **already archived**.
   Supports `dry_run`. This is the only way memory leaves the database.
+  Erasure is complete (#398): purge also deletes every superseded version of
+  the purged entities from `entity_history` and redacts journal rows that
+  reference them (payloads scrubbed in place; the rows themselves are kept
+  because the audit hash chain covers row identity, so `verify_audit_chain`
+  stays valid). `forget` then `purge` is the GDPR-style erasure path.
+
+## Version history retention (#398)
+
+Every content overwrite of a `(category, key)` snapshots the prior version
+into `entity_history` (that is what powers `as_of` time-travel), and every
+audited write appends to `journal`. Both are append-only by default —
+**nothing is evicted unless you opt in**, so out of the box the behavior is
+exactly the historical one: keep everything.
+
+Opt-in bounds (env knobs; enforcement runs only in maintenance paths —
+`mimir_maintenance` `history`/`all`, `mimir_autocohere`, and
+`mimir_prune scope='history'` — never on the write path):
+
+| Knob | Meaning |
+|---|---|
+| `MIMIR_HISTORY_MAX_AGE_DAYS` | Evict versions invalidated more than N days ago. |
+| `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY` | Keep at most N stored versions per `(category, key, workspace)`; oldest evicted first. Hot state-like keys are the pathological growth case — 100–500 is a sensible cap. |
+| `MIMIR_HISTORY_MAX_BYTES` | Global budget over stored history body bytes; globally-oldest versions evicted until under budget. |
+| `MIMIR_HISTORY_TOMBSTONES` | Default ON. Set `0` to hard-delete instead of tombstoning. |
+
+Eviction is always oldest-first along the transaction-time axis, so the
+evicted rows form a contiguous prefix of each key's version trail. With
+tombstones ON (the default, and the mode aligned with the bi-temporal
+contract), each evicted prefix is replaced by **one** synthetic history row
+spanning `[first_recorded_at, last_invalidated_at)` carrying the rolled-up
+version count and a hash-chain digest of the evicted rows. `mimir_as_of` at
+an instant inside a compacted window returns an explicit
+`compacted: true` marker (with `versions_compacted` and `digest`) instead of
+silently-wrong data; instants covered by surviving versions are answered
+exactly as before. Successive passes merge tombstones (counts accumulate,
+digests chain).
+
+`mimir_prune` with `scope: 'history'` enforces the same policy on demand
+(per-call overrides: `max_age_days`, `max_versions_per_key`, `max_bytes`) and
+`dry_run: true` reports the exact rows + bytes the real run would evict.
+`mimir_stats` surfaces the growth signal: `total_history_rows`,
+`history_bytes`, and `top_history_keys` (top-10 keys by version count).
+
+Export-then-delete ("compose don't replace": archive evicted versions to
+vault Markdown/JSONL before eviction) is a planned follow-up, not yet
+implemented.
 
 ## Consolidation ("local dreaming")
 

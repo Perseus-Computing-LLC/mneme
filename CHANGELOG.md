@@ -6,6 +6,30 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- History retention mechanism (#398): entity_history can now be bounded via
+  env knobs — `MIMIR_HISTORY_MAX_AGE_DAYS`, `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY`
+  (oldest-first per key), `MIMIR_HISTORY_MAX_BYTES` (globally oldest-first).
+  **Every knob defaults OFF** — with none set, behavior is byte-identical to
+  before (keep everything); enabling a bound is an explicit operator decision.
+  Enforcement runs only in maintenance paths (`mimir_maintenance` `history`/
+  `all`, `mimir_autocohere`, `mimir_prune scope='history'`), never on the
+  write path.
+- Tombstone roll-up compaction (#398, issue option 2 — default ON, disable
+  via `MIMIR_HISTORY_TOMBSTONES=0` for hard delete): an evicted run of
+  versions is replaced by ONE synthetic history row spanning
+  [first_recorded_at, last_invalidated_at) carrying the rolled-up version
+  count and a hash-chain digest of the evicted rows (successive passes merge:
+  counts accumulate, digests chain). `mimir_as_of` at an instant inside a
+  compacted window returns an explicit marker (`compacted: true`,
+  `versions_compacted`, `digest`) instead of silently-wrong data; instants
+  covered by surviving rows are answered exactly as before. Option 3
+  (export-then-delete to vault Markdown/JSONL) is deferred as a follow-up.
+- `mimir_prune` gains `scope: 'history'` (#398) with per-call bound overrides
+  (`max_age_days`, `max_versions_per_key`, `max_bytes`) and dry_run
+  preview — reports the exact rows + bytes the real run would evict.
+- `mimir_stats` reports history growth (#398): `total_history_rows`,
+  `history_bytes` (stored body bytes), and `top_history_keys` (top-10 keys by
+  version count with bytes) — the hot state-like keys to cap first.
 - `mimir_follow` accepts an optional `workspace_hash` (#396, the #338
   pattern): when set, the efficacy stamp resolves its target row with strict
   workspace equality — the same semantics as a workspace-scoped recall — so a
@@ -38,6 +62,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   7,714µs → ~159µs (~48×).
 
 ### Fixed
+- `mimir_purge` now honors its own "actually remove" contract (#398): purging
+  an archived entity also DELETEs every superseded version of it from
+  `entity_history` (matched by id and by category/key/workspace, so versions
+  written under earlier ids of the same key are erased too) and REDACTS
+  journal rows referencing it — payload columns scrubbed in place,
+  `event_type` stamped `redacted`. Journal rows are redacted rather than
+  deleted because the audit chain hashes only (prev_hash, id, created_at);
+  redaction removes every purged body from the log while
+  `verify_audit_chain` stays valid end-to-end. Before this fix a GDPR-style
+  forget-then-purge left all historical bodies readable via
+  `mimir_history`/`mimir_as_of` and the journal append-only forever.
+  `PurgeReport` gains `history_rows_deleted` / `journal_rows_redacted`
+  (dry_run previews both with the same predicates).
 - `follow()`'s row resolution no longer collapses real DB errors into
   "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
   the clean `found: false` report; a locked file or corruption error now
