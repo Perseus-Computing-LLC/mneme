@@ -3,7 +3,7 @@
 All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.14.0] - 2026-07-02
 
 ### Added
 - Recall-first context injection (#366): `mimir_context` / `prepare` default
@@ -46,6 +46,62 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   count 53 → 55.
 
 ### Fixed
+- Pool-exhaustion collapse under concurrency (#397): recall, insert, and
+  auto-embed each drew a SECOND pooled connection while holding one, so at
+  ≥ pool-size concurrent requests every slot was held by a frame blocking on
+  the nested draw — 32 clients vs pool 16 measured 174 req/s with 30-second
+  stalls and failed writes; 64 clients wedged. `apply_recall_side_effects`,
+  `find_near_duplicate`, and `store_embedding` now reuse the caller's held
+  connection (`_with_conn` variants), including `mimir_embed`'s single-entity
+  path; the same load now runs at ~4,200 req/s with zero errors. r2d2's
+  checkout timeout is tunable via `MIMIR_POOL_TIMEOUT_MS`. A new
+  `concurrency-gate` CI workflow pins the load test at 2× pool
+  oversubscription plus the four concurrency hammer tests.
+- decay_tick write amplification (#399): every tick rewrote every
+  non-archived row even when nothing changed — 412MB of WAL per tick on a
+  45MB database at 100k entities. Writes are now skipped when the recomputed
+  score is within epsilon of the stored value (archive and layer-boundary
+  crossings always write), so steady-state ticks write ~zero rows;
+  `entities_updated` now reports rows actually written.
+- `mimir_history` pagination (#403): the tool returned every full decrypted
+  version body with no limit — a hot key with 10k versions produced a
+  ~10-15MB tool response. Now takes `limit` (default 20, newest-first,
+  0 = count-only) and `offset`, and reports `total`/`returned`.
+- follow() cross-workspace efficacy clobber (#391) and lost updates (#385):
+  the key-addressed UPDATE stamped one workspace's counts and
+  `efficacy_status` onto every (category,key) row — other workspaces and
+  archived rows included — and the unlocked read-modify-write lost
+  increments under concurrent calls. follow() now resolves ONE live row
+  (the deterministic get_entity pick) under the audited writer lock and pins
+  its UPDATE to that id.
+- link/unlink pool starvation (#387): both resolved the source entity via
+  `get_entity()`, drawing a second pooled connection while one was held —
+  ≥16 concurrent linkers hit 30s r2d2 timeouts with opaque `Error(None)`.
+  Ids now resolve on the caller's own connection.
+- cohere error-path transaction leak (#388, corrected premise): the raw
+  `BEGIN IMMEDIATE`/`COMMIT` pair had no rollback guard — any error between
+  them returned the pooled connection with the transaction still open,
+  permanently poisoning that slot ("cannot start a transaction within a
+  transaction" on every subsequent checkout). cohere now uses the drop-safe
+  transaction; errors roll back. (The filed links-clobber scenario could not
+  occur — the pair-scan read already ran inside the writer transaction.)
+- remember() erased link graphs (#382): the MCP remember tool constructs
+  entities with empty links and remember's full-row UPDATE wrote them
+  wholesale — ANY re-remember of a linked entity deterministically erased
+  its edges, and concurrent `mimir_link` calls could lose edges to the
+  unguarded read-modify-write. link/unlink now run under the writer lock and
+  remember UNIONS caller links with stored links (dedup by target;
+  stored relationship/weight win; `mimir_unlink` is the only removal path).
+- invalidate_entity temporal-window corruption (#381): the fourth
+  `entity_history` writer stamped `invalidated_at = now()` raw — an audited
+  writer that legitimately set `recorded_at` ahead of the wall clock produced
+  an INVERTED window, and a same-millisecond create+invalidate produced a
+  zero-width window that `mimir_as_of` could never reconstruct. It now takes
+  the writer lock and bumps `invalidated_at` strictly past `recorded_at`.
+- rekey-aad stale overwrite (#386): a `remember()` landing between rekey's
+  read and its re-encrypted write was silently reverted to stale content
+  under a valid ciphertext; the per-row write is now guarded on the
+  ciphertext being unchanged.
 - Audited-writer TOCTOU (#379): the three audited temporal writers (the #371
   re-assert path in remember, the #373 `set_valid_to` close, the #377 status
   flip) read their preconditions on the bare pooled connection before opening
