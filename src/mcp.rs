@@ -2936,6 +2936,174 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       "destructiveHint": true
     },
     "title": "Run Database Maintenance"
+  },
+  {
+    "name": "mimir_communities",
+    "description": "GraphRAG community detection: partition the entity link graph (built via mimir_link) into communities using deterministic label propagation or greedy modularity ('louvain'). Persists the result with an extractive summary per community; community ids are derived from the member set, so re-detection after membership changes yields new ids. Local-first — no LLM or network required.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace scope for the graph. Empty = global/unscoped entities."
+        },
+        "algorithm": {
+          "type": "string",
+          "default": "label_prop",
+          "enum": ["label_prop", "louvain"],
+          "description": "Detection algorithm: 'label_prop' (deterministic label propagation, default) or 'louvain' (greedy one-level modularity optimization)."
+        },
+        "min_size": {
+          "type": "integer",
+          "default": 2,
+          "description": "Minimum member count for a community to be kept (minimum 2 — isolated entities never form communities)."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": { "type": "string" },
+        "algorithm": { "type": "string" },
+        "node_count": { "type": "integer", "description": "Entities considered as graph nodes" },
+        "edge_count": { "type": "integer", "description": "Undirected edges in the graph" },
+        "modularity": { "type": "number", "description": "Newman modularity of the detected partition" },
+        "communities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string", "description": "Community id ('com-' + member-set digest)" },
+              "size": { "type": "integer" },
+              "member_ids": { "type": "array", "items": { "type": "string" } },
+              "summary": { "type": "string", "description": "Extractive summary (top members by in-community degree), capped in size" }
+            }
+          }
+        },
+        "stale_summaries_archived": { "type": "integer", "description": "Stale community_summary entities archived because membership changed" },
+        "generated_at_unix_ms": { "type": "integer" }
+      }
+    },
+    "annotations": {
+      "idempotentHint": true
+    },
+    "title": "Detect Link-Graph Communities"
+  },
+  {
+    "name": "mimir_community_summary",
+    "description": "Return (and materialize) the summary of one detected community. Default is the extractive summary (top representative members); set use_llm=true for an optional LLM polish that degrades back to extractive when no LLM endpoint is configured. The summary is stored as a 'community_summary' entity carrying evidence_for links to its members, and cached while membership is unchanged.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "community_id": {
+          "type": "string",
+          "description": "Community id from mimir_communities, e.g. 'com-1a2b3c4d5e6f7a8b'"
+        },
+        "use_llm": {
+          "type": "boolean",
+          "default": false,
+          "description": "Polish the summary with the configured LLM (--llm-endpoint). Never required: falls back to the extractive summary on error or when disabled."
+        },
+        "refresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Force regeneration even when a cached summary entity exists."
+        }
+      },
+      "required": ["community_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "community_id": { "type": "string" },
+        "summary": { "type": "string" },
+        "summary_entity_id": { "type": "string", "description": "entities.id of the materialized community_summary entity" },
+        "member_count": { "type": "integer" },
+        "cached": { "type": "boolean", "description": "True when an existing summary entity was reused (membership unchanged)" },
+        "llm_used": { "type": "boolean" }
+      }
+    },
+    "annotations": {
+      "idempotentHint": true
+    },
+    "title": "Get Community Summary"
+  },
+  {
+    "name": "mimir_global_recall",
+    "description": "GraphRAG global search: answer a broad 'what does the vault know about X, holistically' query by scoring it against community summaries first (breadth), then drilling into the best communities' member entities (depth). Cites entities across multiple communities instead of returning only the single nearest cluster like flat recall. Detects communities automatically on first use. Local-first and deterministic; optional use_llm synthesizes the final answer.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The global question to answer across the whole memory graph"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace scope. Empty = global/unscoped entities."
+        },
+        "top_communities": {
+          "type": "integer",
+          "default": 3,
+          "description": "How many best-matching communities to drill into"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Max member entities cited across all communities (round-robined so every matched community is represented)"
+        },
+        "auto_detect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run community detection automatically when none are persisted yet"
+        },
+        "use_llm": {
+          "type": "boolean",
+          "default": false,
+          "description": "Synthesize the final answer with the configured LLM; degrades to the extractive answer on error or when disabled."
+        }
+      },
+      "required": ["query"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string" },
+        "workspace_hash": { "type": "string" },
+        "communities_considered": { "type": "integer", "description": "Persisted communities scored in the breadth pass" },
+        "communities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "score": { "type": "number", "description": "Distinct query-token hits in the community summary" },
+              "size": { "type": "integer" },
+              "summary": { "type": "string" },
+              "members": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "category": { "type": "string" },
+                    "key": { "type": "string" },
+                    "score": { "type": "number" },
+                    "snippet": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "answer": { "type": "string", "description": "Extractive (or LLM-synthesized) holistic answer citing entities across communities" },
+        "llm_used": { "type": "boolean" }
+      }
+    },
+    "title": "Global Recall (GraphRAG)"
   }
 ]"###
         ).expect("tools JSON must be valid");
@@ -3052,6 +3220,12 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_correct" => tools::handle_correct(db, args).map_err(|e| e.to_string()),
         "mimir_synthesize" => tools::handle_synthesize(db, args).map_err(|e| e.to_string()),
         "mimir_bench" => tools::handle_bench(db, args).map_err(|e| e.to_string()),
+
+        "mimir_communities" => tools::handle_communities(db, args).map_err(|e| e.to_string()),
+        "mimir_community_summary" => {
+            tools::handle_community_summary(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_global_recall" => tools::handle_global_recall(db, args).map_err(|e| e.to_string()),
 
         "mimir_autocohere" => tools::handle_autocohere(db, args).map_err(|e| e.to_string()),
         "mimir_supersede" => tools::handle_supersede(db, args).map_err(|e| e.to_string()),
@@ -3316,6 +3490,70 @@ mod tests {
         assert_eq!(ev["total"].as_i64().unwrap(), 0);
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn graphrag_tools_dispatch_including_aliases() {
+        // #365: the three GraphRAG tools must be dispatchable under the
+        // canonical mimir_* name and both rename aliases, and must appear in
+        // tools/list.
+        let db_path =
+            std::env::temp_dir().join(format!("mimir-graphrag-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // Two linked entities so detection has a community to find.
+        tools::handle_remember(
+            &db,
+            json!({"category":"g","key":"n1","body_json":"{\"content\":\"quasar telescope\"}"}),
+        )
+        .expect("remember n1");
+        tools::handle_remember(
+            &db,
+            json!({"category":"g","key":"n2","body_json":"{\"content\":\"nebula filter rig\"}"}),
+        )
+        .expect("remember n2");
+        let n2 = db.get_entity("g", "n2").unwrap().expect("n2 exists");
+        db.link("g", "n1", &n2.id, "related").expect("link");
+
+        let detect = call_tool("mimir_communities", &db, json!({}), None);
+        let v: Value = serde_json::from_str(&detect).expect("valid JSON");
+        assert_eq!(v["communities"].as_array().unwrap().len(), 1, "got: {detect}");
+        let cid = v["communities"][0]["id"].as_str().unwrap().to_string();
+
+        // Alias dispatch: perseus_vault_* and mneme_* normalize to mimir_*.
+        let summary = call_tool(
+            "perseus_vault_community_summary",
+            &db,
+            json!({"community_id": cid}),
+            None,
+        );
+        let sv: Value = serde_json::from_str(&summary).expect("valid JSON");
+        assert_eq!(sv["community_id"].as_str().unwrap(), cid, "got: {summary}");
+        assert!(sv.get("isError").is_none(), "got: {summary}");
+
+        let recall = call_tool("mneme_global_recall", &db, json!({"query": "quasar"}), None);
+        let rv: Value = serde_json::from_str(&recall).expect("valid JSON");
+        assert!(rv.get("isError").is_none(), "got: {recall}");
+        assert_eq!(rv["communities"].as_array().unwrap().len(), 1, "got: {recall}");
+
+        // tools/list advertises all three (x3 with aliases).
+        let listed = list_tools(Some(json!(1)));
+        let tools_arr = listed.result.unwrap()["tools"].as_array().unwrap().clone();
+        for tool in [
+            "mimir_communities",
+            "mimir_community_summary",
+            "mimir_global_recall",
+            "mneme_global_recall",
+            "perseus_vault_communities",
+        ] {
+            assert!(
+                tools_arr.iter().any(|t| t["name"] == tool),
+                "tools/list must advertise {tool}"
+            );
+        }
+
+        drop(db);
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]

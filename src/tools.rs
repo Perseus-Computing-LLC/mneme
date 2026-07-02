@@ -1267,6 +1267,66 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
     }
 }
 
+// ─── GraphRAG community tools (#365) ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CommunitiesArgs {
+    #[serde(default)]
+    pub workspace_hash: String,
+    /// 'label_prop' (default) or 'louvain'.
+    #[serde(default)]
+    pub algorithm: String,
+    /// Minimum community size to keep (isolated nodes never form communities).
+    #[serde(default = "default_min_community_size")]
+    pub min_size: usize,
+}
+
+fn default_min_community_size() -> usize {
+    2
+}
+
+/// Detect (and persist) communities over the workspace's link graph.
+pub fn handle_communities(db: &Database, args: Value) -> Result<String, String> {
+    let a: CommunitiesArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid communities arguments: {}", e))?;
+    let report = db
+        .detect_communities(&a.workspace_hash, &a.algorithm, a.min_size)
+        .map_err(|e| format!("Community detection failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommunitySummaryArgs {
+    pub community_id: String,
+    /// Optional LLM polish; extractive summary is always the fallback.
+    #[serde(default)]
+    pub use_llm: bool,
+    /// Force regeneration even when a cached summary entity exists.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// Return (and materialize) the summary for one detected community.
+pub fn handle_community_summary(db: &Database, args: Value) -> Result<String, String> {
+    let a: CommunitySummaryArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid community_summary arguments: {}", e))?;
+    let result = db
+        .community_summary(&a.community_id, a.use_llm, a.refresh)
+        .map_err(|e| format!("Community summary failed: {}", e))?;
+    serde_json::to_string(&result).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+/// GraphRAG global recall: breadth over community summaries, then depth into
+/// the best communities' members.
+pub fn handle_global_recall(db: &Database, args: Value) -> Result<String, String> {
+    let params: crate::communities::GlobalRecallParams = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid global_recall arguments: {}", e))?;
+    let result = db
+        .global_recall(&params)
+        .map_err(|e| format!("Global recall failed: {}", e))?;
+    serde_json::to_string(&result).map_err(|e| format!("Serialization failed: {}", e))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ScoreArgs {
     pub category: String,
